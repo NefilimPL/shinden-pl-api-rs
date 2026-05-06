@@ -1,0 +1,88 @@
+use shinden_pl_api::client_backend::{
+    DiscoveryAnime, EpisodeProgress, ShindenClientBackend, WatchingAnime, WatchingAnimeFilter,
+};
+
+#[test]
+fn backend_can_be_constructed_without_network_access() {
+    let backend = ShindenClientBackend::new();
+
+    assert!(backend.is_ok());
+}
+
+#[test]
+fn frontend_contract_types_keep_expected_json_shape() {
+    let watching = WatchingAnime {
+        title_id: 59922,
+        name: "Enen no Shouboutai".to_string(),
+        url: "https://shinden.pl/series/59922".to_string(),
+        image_url: "https://cdn.shinden.eu/cdn1/images/genuine/59922.jpg".to_string(),
+        anime_type: "TV".to_string(),
+        rating: "8.10".to_string(),
+        episodes: "2 / 12".to_string(),
+        description: "Fire force".to_string(),
+        watch_status: "in progress".to_string(),
+        is_favourite: 1,
+        watched_episodes_count: 2,
+        total_episodes: Some(12),
+    };
+    let watching_json = serde_json::to_value(watching).expect("watching anime serializes");
+
+    assert_eq!(watching_json["titleId"], 59922);
+    assert_eq!(watching_json["watchStatus"], "in progress");
+    assert_eq!(watching_json["isFavourite"], 1);
+    assert_eq!(watching_json["watchedEpisodesCount"], 2);
+    assert_eq!(watching_json["totalEpisodes"], 12);
+
+    let discovery = DiscoveryAnime {
+        name: "Season show".to_string(),
+        url: "https://shinden.pl/series/60001".to_string(),
+        image_url: "https://cdn.shinden.eu/cdn1/images/genuine/60001.jpg".to_string(),
+        anime_type: "TV".to_string(),
+        rating: "7.50".to_string(),
+        episodes: "12".to_string(),
+        description: "Season entry".to_string(),
+        title_id: Some(60001),
+        watch_status: "completed".to_string(),
+        is_favourite: 0,
+        total_episodes: Some(12),
+        source_label: Some("Nowe".to_string()),
+    };
+    let discovery_json = serde_json::to_value(discovery).expect("discovery anime serializes");
+
+    assert_eq!(discovery_json["titleId"], 60001);
+    assert_eq!(discovery_json["watchStatus"], "completed");
+    assert_eq!(discovery_json["isFavourite"], 0);
+    assert_eq!(discovery_json["totalEpisodes"], 12);
+    assert_eq!(discovery_json["sourceLabel"], "Nowe");
+
+    let progress = EpisodeProgress {
+        title: "Episode 2".to_string(),
+        link: "https://shinden.pl/episode/2".to_string(),
+        episode_id: Some(168519),
+        episode_no: 2,
+        watched: true,
+        view_count: 1,
+        total_episodes: Some(12),
+        is_true_final_episode: false,
+    };
+    let progress_json = serde_json::to_value(progress).expect("episode progress serializes");
+
+    assert_eq!(progress_json["episodeId"], 168519);
+    assert_eq!(progress_json["episodeNo"], 2);
+    assert_eq!(progress_json["viewCount"], 1);
+    assert_eq!(progress_json["totalEpisodes"], 12);
+    assert_eq!(progress_json["isTrueFinalEpisode"], false);
+
+    let filter = WatchingAnimeFilter {
+        only_available_unwatched: Some(true),
+        subtitle_language: Some("PL".to_string()),
+        check_subtitle_availability_online: Some(true),
+        exclude_ai_subtitles: Some(true),
+    };
+    let filter_json = serde_json::to_value(filter).expect("watching filter serializes");
+
+    assert_eq!(filter_json["onlyAvailableUnwatched"], true);
+    assert_eq!(filter_json["subtitleLanguage"], "PL");
+    assert_eq!(filter_json["checkSubtitleAvailabilityOnline"], true);
+    assert_eq!(filter_json["excludeAiSubtitles"], true);
+}

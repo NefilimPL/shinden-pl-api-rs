@@ -6,3 +6,4 @@ pub mod search;
 pub mod user;
 pub mod video;
 pub mod player;
+pub mod client_backend;
