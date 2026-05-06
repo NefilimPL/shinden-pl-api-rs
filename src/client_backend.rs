@@ -1625,10 +1625,12 @@ fn merge_episode_progress(
         .enumerate()
         .map(|(index, episode)| {
             let fallback_episode_no = (index + 1).min(u32::MAX as usize) as u32;
-            let progress = progress_by_number.get(&fallback_episode_no);
+            let playback_episode_no =
+                episode_number_from_playback_title(&episode.title).unwrap_or(fallback_episode_no);
+            let progress = progress_by_number.get(&playback_episode_no);
             let episode_no = progress
                 .map(|progress| progress.episode_no)
-                .unwrap_or(fallback_episode_no);
+                .unwrap_or(playback_episode_no);
             let watched = progress.and_then(|progress| progress.watched.as_ref());
 
             EpisodeProgress {
@@ -1643,6 +1645,39 @@ fn merge_episode_progress(
             }
         })
         .collect()
+}
+
+fn episode_number_from_playback_title(title: &str) -> Option<u32> {
+    let normalized = title.trim().to_ascii_lowercase();
+    if !(normalized.starts_with("episode ") || normalized.starts_with("odcinek ")) {
+        return None;
+    }
+
+    last_ascii_number(title)
+}
+
+fn last_ascii_number(value: &str) -> Option<u32> {
+    let mut digits_reversed = String::new();
+    let mut found_digit = false;
+
+    for character in value.chars().rev() {
+        if character.is_ascii_digit() {
+            found_digit = true;
+            digits_reversed.push(character);
+            continue;
+        }
+
+        if found_digit {
+            break;
+        }
+    }
+
+    if digits_reversed.is_empty() {
+        return None;
+    }
+
+    let digits: String = digits_reversed.chars().rev().collect();
+    digits.parse::<u32>().ok()
 }
 
 fn extract_user_id_from_profile_html(html: &str) -> Option<String> {
@@ -2273,7 +2308,7 @@ fn cache_entry_satisfies_refresh(
         return false;
     }
 
-    if now_ms.saturating_sub(entry.checked_at_ms) > WATCHING_CACHE_TTL_MS {
+    if entry.checked_at_ms == 0 || now_ms.saturating_sub(entry.checked_at_ms) > WATCHING_CACHE_TTL_MS {
         return false;
     }
 
