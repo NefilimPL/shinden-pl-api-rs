@@ -1,12 +1,12 @@
 [package]
 name = "shinden-pl-api"
 version = "0.1.6"
-authors = ["Błażej Drozd"]
+authors = ["Błażej Drozd", "NefilimPL"]
 edition = "2024"
 
 description = "A blazingly fast API client for Shinden.pl, written in Rust."
 license = "MIT"
-repository = "https://github.com/Tsugumik/shinden-pl-api-rs"
+repository = "https://github.com/NefilimPL/shinden-pl-api-rs"
 keywords = ["shinden", "api", "scraper", "anime", "rust"]
 readme = "README.md"
 
