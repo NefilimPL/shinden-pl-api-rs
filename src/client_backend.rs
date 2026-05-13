@@ -551,6 +551,51 @@ impl ShindenClientBackend {
         }
     }
 
+    pub async fn update_anime_rating(&self, update: AnimeRatingUpdate) -> Result<(), String> {
+        let rating_type = normalize_rating_type(&update.rating_type).ok_or_else(|| {
+            command_error(
+                "update_anime_rating",
+                format!("Unsupported anime rating type: {}", update.rating_type),
+            )
+        })?;
+        let title_type = if update.title_type.trim().is_empty() {
+            "anime".to_string()
+        } else {
+            update.title_type.trim().to_ascii_lowercase()
+        };
+        let update = AnimeRatingUpdate {
+            title_id: update.title_id,
+            title_type,
+            rating_type,
+            value: update.value.min(10),
+        };
+        let page_html = self
+            .api
+            .get_html(&series_url(update.title_id))
+            .await
+            .map_err(|e| command_error("update_anime_rating auth", e))?;
+        let auth = basic_auth_token(&page_html)
+            .ok_or_else(|| command_error("update_anime_rating auth", "Shinden auth token missing"))?;
+        let response = self
+            .api
+            .post_form(
+                &anime_rating_url(&update.title_type, update.title_id),
+                &rating_update_form(&update, &auth),
+                None,
+            )
+            .await
+            .map_err(|e| command_error("update_anime_rating", e))?;
+
+        if rating_response_is_success(&response) {
+            Ok(())
+        } else {
+            Err(command_error(
+                "update_anime_rating",
+                format!("Shinden rejected rating update: {response}"),
+            ))
+        }
+    }
+
     pub async fn mark_episode_watched(
         &self,
         title_id: u64,
@@ -1685,51 +1730,6 @@ fn last_ascii_number(value: &str) -> Option<u32> {
 
         if found_digit {
             break;
-        }
-    }
-
-    pub async fn update_anime_rating(&self, update: AnimeRatingUpdate) -> Result<(), String> {
-        let rating_type = normalize_rating_type(&update.rating_type).ok_or_else(|| {
-            command_error(
-                "update_anime_rating",
-                format!("Unsupported anime rating type: {}", update.rating_type),
-            )
-        })?;
-        let title_type = if update.title_type.trim().is_empty() {
-            "anime".to_string()
-        } else {
-            update.title_type.trim().to_ascii_lowercase()
-        };
-        let update = AnimeRatingUpdate {
-            title_id: update.title_id,
-            title_type,
-            rating_type,
-            value: update.value.min(10),
-        };
-        let page_html = self
-            .api
-            .get_html(&series_url(update.title_id))
-            .await
-            .map_err(|e| command_error("update_anime_rating auth", e))?;
-        let auth = basic_auth_token(&page_html)
-            .ok_or_else(|| command_error("update_anime_rating auth", "Shinden auth token missing"))?;
-        let response = self
-            .api
-            .post_form(
-                &anime_rating_url(&update.title_type, update.title_id),
-                &rating_update_form(&update, &auth),
-                None,
-            )
-            .await
-            .map_err(|e| command_error("update_anime_rating", e))?;
-
-        if rating_response_is_success(&response) {
-            Ok(())
-        } else {
-            Err(command_error(
-                "update_anime_rating",
-                format!("Shinden rejected rating update: {response}"),
-            ))
         }
     }
 
