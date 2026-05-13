@@ -415,10 +415,39 @@ impl ShindenClientBackend {
     }
 
     pub async fn get_anime_details(&self, url: String) -> Result<AnimeDetails, String> {
-        self.api
+        let details = self.api
             .get_anime_details(&url)
             .await
-            .map_err(|e| command_error("get_anime_details", e))
+            .map_err(|e| command_error("get_anime_details", e))?;
+
+        let (title_status, user_status_loaded) = match details.title_id {
+            Some(title_id) => match fetch_current_user_id_cached(
+                &self.api,
+                &self.user_id_cache,
+                "get_anime_details",
+            )
+            .await
+            {
+                Ok(user_id) => match fetch_title_status(&self.api, title_id, &user_id).await {
+                    Ok(title_status) => (title_status, true),
+                    Err(error) => {
+                        let _ = command_error("get_anime_details status fallback", error);
+                        (None, false)
+                    }
+                },
+                Err(error) => {
+                    let _ = command_error("get_anime_details user fallback", error);
+                    (None, false)
+                }
+            },
+            None => (None, false),
+        };
+
+        Ok(anime_details_with_title_status(
+            details,
+            title_status,
+            user_status_loaded,
+        ))
     }
 
     pub async fn get_watching_anime(
@@ -970,6 +999,28 @@ async fn fetch_title_status(
     }
 
     Ok(payload.result.title)
+}
+
+fn anime_details_with_title_status(
+    mut details: AnimeDetails,
+    title_status: Option<TitleStatusApiTitle>,
+    user_status_loaded: bool,
+) -> AnimeDetails {
+    if user_status_loaded {
+        details.user_status_loaded = true;
+    }
+
+    if let Some(title_status) = title_status {
+        details.watch_status = title_status
+            .watch_status
+            .unwrap_or_else(|| "no".to_string());
+        details.is_favourite = title_status.is_favourite.unwrap_or_default();
+    } else if user_status_loaded {
+        details.watch_status = "no".to_string();
+        details.is_favourite = 0;
+    }
+
+    details
 }
 
 async fn fetch_title_episode_progress(
@@ -3275,6 +3326,49 @@ mod tests {
         assert_eq!(results[0].watch_status, "completed");
         assert_eq!(results[0].is_favourite, 1);
         assert_eq!(results[0].total_episodes, Some(12));
+    }
+
+    #[test]
+    fn anime_details_uses_fetched_title_status() {
+        let details = AnimeDetails {
+            title_id: Some(59211),
+            watch_status: "no".to_string(),
+            is_favourite: 0,
+            user_status_loaded: false,
+            ..AnimeDetails::default()
+        };
+
+        let details = anime_details_with_title_status(
+            details,
+            Some(TitleStatusApiTitle {
+                watch_status: Some("completed".to_string()),
+                is_favourite: Some(1),
+                priority: Some(0),
+                recommend: Some(0),
+            }),
+            true,
+        );
+
+        assert_eq!(details.watch_status, "completed");
+        assert_eq!(details.is_favourite, 1);
+        assert!(details.user_status_loaded);
+    }
+
+    #[test]
+    fn anime_details_marks_loaded_when_title_has_no_status() {
+        let details = AnimeDetails {
+            title_id: Some(59211),
+            watch_status: "completed".to_string(),
+            is_favourite: 1,
+            user_status_loaded: false,
+            ..AnimeDetails::default()
+        };
+
+        let details = anime_details_with_title_status(details, None, true);
+
+        assert_eq!(details.watch_status, "no");
+        assert_eq!(details.is_favourite, 0);
+        assert!(details.user_status_loaded);
     }
 
     #[test]

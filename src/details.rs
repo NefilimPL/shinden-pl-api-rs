@@ -17,6 +17,9 @@ pub struct AnimeDetails {
     pub related_series: Vec<RelatedSeries>,
     pub community_rating: AnimeCommunityRating,
     pub user_ratings: AnimeUserRatings,
+    pub watch_status: String,
+    pub is_favourite: u8,
+    pub user_status_loaded: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -95,6 +98,9 @@ pub fn parse_anime_details_html(html: &str, page_url: &str) -> AnimeDetails {
         related_series: related_series(&doc),
         community_rating: community_rating(&doc),
         user_ratings: user_ratings(&doc),
+        watch_status: "no".to_string(),
+        is_favourite: 0,
+        user_status_loaded: false,
     }
 }
 
@@ -483,5 +489,23 @@ mod tests {
         let html = "<script>_Storage.basic = 'abc123';</script>";
 
         assert_eq!(basic_auth_token(html).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn anime_details_serializes_default_user_status() {
+        let details = parse_anime_details_html(
+            r#"
+                <h1 class="page-title anime kind-tv" data-tt="tv">
+                    <span class="kind">Anime</span><span class="title">Mobseka</span>
+                </h1>
+            "#,
+            "https://shinden.pl/series/59211-otomege-sekai-wa-mob-ni-kibishii-sekai-desu",
+        );
+
+        let value = serde_json::to_value(details).unwrap();
+
+        assert_eq!(value["watchStatus"].as_str(), Some("no"));
+        assert_eq!(value["isFavourite"].as_u64(), Some(0));
+        assert_eq!(value["userStatusLoaded"].as_bool(), Some(false));
     }
 }
