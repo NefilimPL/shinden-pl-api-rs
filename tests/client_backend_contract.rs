@@ -1,6 +1,7 @@
 use shinden_pl_api::client_backend::{
     DiscoveryAnime, EpisodeProgress, ShindenClientBackend, UserAnimeListCounts, UserAnimeListItem,
-    UserAnimeListsPayload, WatchingAnime, WatchingAnimeFilter,
+    UserAnimeListRefreshStatus, UserAnimeListRefreshSummary, UserAnimeListsPayload, WatchingAnime,
+    WatchingAnimeFilter,
 };
 
 #[test]
@@ -129,4 +130,29 @@ fn frontend_contract_types_keep_expected_json_shape() {
     assert_eq!(json["items"][0]["ageRating"], "R17+");
     assert_eq!(json["counts"]["inProgress"], 1);
     assert_eq!(json["counts"]["all"], 1);
+
+    let refresh_status = UserAnimeListRefreshStatus {
+        running: true,
+        current: 2,
+        total: 5,
+        remaining: 3,
+        refreshed: 2,
+        failed: 0,
+        current_title: "Season show".to_string(),
+        last_finished_at_ms: None,
+        last_error: None,
+    };
+    let refresh_summary = UserAnimeListRefreshSummary {
+        status: refresh_status,
+        already_running: true,
+    };
+    let refresh_json =
+        serde_json::to_value(refresh_summary).expect("user list refresh summary serializes");
+
+    assert_eq!(refresh_json["alreadyRunning"], true);
+    assert_eq!(refresh_json["status"]["running"], true);
+    assert_eq!(refresh_json["status"]["current"], 2);
+    assert_eq!(refresh_json["status"]["total"], 5);
+    assert_eq!(refresh_json["status"]["remaining"], 3);
+    assert_eq!(refresh_json["status"]["currentTitle"], "Season show");
 }

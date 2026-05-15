@@ -7,7 +7,7 @@ use crate::models::{Anime, Episode, Player};
 use futures_util::stream::{self, StreamExt};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, ORIGIN, REFERER};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,7 @@ const WATCHING_CACHE_TTL_MS: u64 = 30 * 60 * 1000;
 const WATCHING_CACHE_REFRESH_CONCURRENCY: usize = 4;
 const WATCHING_CACHE_REQUEST_RETRIES: usize = 2;
 const WATCHING_CACHE_RETRY_DELAY_MS: u64 = 750;
+const USER_ANIME_LIST_DETAIL_REFRESH_CONCURRENCY: usize = 4;
 const USER_ID_CACHE_TTL_MS: u64 = 60 * 60 * 1000;
 const SHINDEN_TITLE_PLACEHOLDER: &str =
     "https://shinden.pl/res/other/placeholders/title/100x100.jpg";
@@ -206,6 +207,27 @@ pub struct WatchingCacheRefreshSummary {
     pub already_running: bool,
 }
 
+#[derive(Debug, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UserAnimeListRefreshStatus {
+    pub running: bool,
+    pub current: usize,
+    pub total: usize,
+    pub remaining: usize,
+    pub refreshed: usize,
+    pub failed: usize,
+    pub current_title: String,
+    pub last_finished_at_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UserAnimeListRefreshSummary {
+    pub status: UserAnimeListRefreshStatus,
+    pub already_running: bool,
+}
+
 struct WatchingCacheRefreshPlan {
     items_to_scan: Vec<WatchingListApiItem>,
     skipped: usize,
@@ -295,6 +317,26 @@ pub struct UserAnimeListsPayload {
 struct UserAnimeListCache {
     items: HashMap<String, UserAnimeListItem>,
     refreshed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct UserAnimeListRefreshState {
+    queue: Vec<UserAnimeListRefreshQueueItem>,
+    started_at_ms: Option<u64>,
+    last_finished_at_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UserAnimeListRefreshQueueItem {
+    key: String,
+    title_id: u64,
+    title: String,
+    url: String,
+    done: bool,
+    failed: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -390,6 +432,7 @@ struct WatchedEpisodeChangeInput {
 pub struct ShindenClientBackend {
     api: ShindenAPI,
     refresh_status: Mutex<WatchingCacheRefreshStatus>,
+    user_anime_list_refresh_status: Mutex<UserAnimeListRefreshStatus>,
     user_id_cache: Mutex<CachedUserId>,
 }
 
@@ -403,6 +446,7 @@ impl ShindenClientBackend {
         Ok(Self {
             api,
             refresh_status: Mutex::new(WatchingCacheRefreshStatus::default()),
+            user_anime_list_refresh_status: Mutex::new(UserAnimeListRefreshStatus::default()),
             user_id_cache: Mutex::new(CachedUserId::default()),
         })
     }
@@ -536,12 +580,16 @@ impl ShindenClientBackend {
 
         match fetch_all_userlist_items(&self.api, &self.user_id_cache).await {
             Ok(items) => {
+                let existing_keys = user_anime_list_cache_keys(&cache);
                 merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
-                let sync_error = if force_refresh {
-                    refresh_user_anime_detail_metadata(&self.api, &mut cache, now_ms).await
-                } else {
-                    None
-                };
+                let new_keys = new_active_user_anime_list_cache_keys(&cache, &existing_keys);
+                let sync_error = refresh_new_user_anime_detail_metadata(
+                    &self.api,
+                    &mut cache,
+                    new_keys,
+                    now_ms,
+                )
+                .await;
                 let active_items = active_user_anime_list_items(&cache);
                 cache.refreshed_at_ms = Some(now_ms);
                 save_user_anime_list_cache(&cache)?;
@@ -563,6 +611,81 @@ impl ShindenClientBackend {
                         Some(error),
                     ))
                 }
+            }
+        }
+    }
+
+    pub fn get_user_anime_list_refresh_status(&self) -> Result<UserAnimeListRefreshStatus, String> {
+        user_anime_list_refresh_status_snapshot(&self.user_anime_list_refresh_status)
+    }
+
+    pub async fn refresh_user_anime_list_cache(
+        &self,
+    ) -> Result<UserAnimeListRefreshSummary, String> {
+        if let Some(summary) =
+            begin_user_anime_list_refresh(&self.user_anime_list_refresh_status, None)?
+        {
+            return Ok(summary);
+        }
+
+        let refresh_result = refresh_user_anime_list_cache_inner(
+            &self.api,
+            &self.user_id_cache,
+            &self.user_anime_list_refresh_status,
+        )
+        .await;
+
+        match refresh_result {
+            Ok(status) => Ok(UserAnimeListRefreshSummary {
+                status,
+                already_running: false,
+            }),
+            Err(error) => {
+                fail_user_anime_list_refresh(&self.user_anime_list_refresh_status, &error)?;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn resume_user_anime_list_cache_refresh(
+        &self,
+    ) -> Result<UserAnimeListRefreshSummary, String> {
+        let mut state = load_user_anime_list_refresh_state();
+        if !user_anime_list_refresh_state_has_pending(&state) {
+            let status = user_anime_list_refresh_status_from_state(&state, false);
+            replace_user_anime_list_refresh_status(
+                &self.user_anime_list_refresh_status,
+                status.clone(),
+            )?;
+            return Ok(UserAnimeListRefreshSummary {
+                status,
+                already_running: false,
+            });
+        }
+
+        if let Some(summary) =
+            begin_user_anime_list_refresh(&self.user_anime_list_refresh_status, Some(&state))?
+        {
+            return Ok(summary);
+        }
+
+        let mut cache = load_user_anime_list_cache();
+        let refresh_result = process_user_anime_list_refresh_queue(
+            &self.api,
+            &self.user_anime_list_refresh_status,
+            &mut cache,
+            &mut state,
+        )
+        .await;
+
+        match refresh_result {
+            Ok(status) => Ok(UserAnimeListRefreshSummary {
+                status,
+                already_running: false,
+            }),
+            Err(error) => {
+                fail_user_anime_list_refresh(&self.user_anime_list_refresh_status, &error)?;
+                Err(error)
             }
         }
     }
@@ -2420,24 +2543,189 @@ fn map_user_anime_list_item(
     })
 }
 
-async fn refresh_user_anime_detail_metadata(
+async fn refresh_user_anime_list_cache_inner(
     api: &ShindenAPI,
-    cache: &mut UserAnimeListCache,
-    updated_at_ms: u64,
-) -> Option<String> {
-    const DETAIL_REFRESH_CONCURRENCY: usize = 4;
+    user_id_cache: &Mutex<CachedUserId>,
+    status: &Mutex<UserAnimeListRefreshStatus>,
+) -> Result<UserAnimeListRefreshStatus, String> {
+    let mut cache = load_user_anime_list_cache();
+    let now_ms = unix_timestamp_ms_u64();
+    let items = fetch_all_userlist_items(api, user_id_cache).await?;
 
-    let targets: Vec<(String, String)> = cache
+    merge_user_anime_list_cache(&mut cache, items, true, now_ms);
+    cache.refreshed_at_ms = Some(now_ms);
+    save_user_anime_list_cache(&cache)?;
+
+    let mut state = build_user_anime_list_refresh_state(&cache, now_ms);
+    save_user_anime_list_refresh_state(&state)?;
+    replace_user_anime_list_refresh_status(
+        status,
+        user_anime_list_refresh_status_from_state(&state, true),
+    )?;
+
+    process_user_anime_list_refresh_queue(api, status, &mut cache, &mut state).await
+}
+
+async fn process_user_anime_list_refresh_queue(
+    api: &ShindenAPI,
+    status: &Mutex<UserAnimeListRefreshStatus>,
+    cache: &mut UserAnimeListCache,
+    state: &mut UserAnimeListRefreshState,
+) -> Result<UserAnimeListRefreshStatus, String> {
+    for index in 0..state.queue.len() {
+        if state.queue[index].done || state.queue[index].failed {
+            continue;
+        }
+
+        update_user_anime_list_refresh_status(status, |status| {
+            status.current_title = state.queue[index].title.clone();
+        })?;
+
+        let key = state.queue[index].key.clone();
+        let title = state.queue[index].title.clone();
+        let url = state.queue[index].url.clone();
+
+        match api.get_anime_details(&url).await {
+            Ok(details) => {
+                if let Some(item) = cache.items.get_mut(&key) {
+                    apply_user_anime_details_to_item(item, &details);
+                    item.updated_at_ms = unix_timestamp_ms_u64();
+                    state.queue[index].done = true;
+                    cache.refreshed_at_ms = Some(item.updated_at_ms);
+                    save_user_anime_list_cache(cache)?;
+                } else {
+                    state.queue[index].failed = true;
+                    state.last_error =
+                        Some(format!("Nie znaleziono anime w lokalnym cache: {title}"));
+                }
+            }
+            Err(error) => {
+                state.queue[index].failed = true;
+                state.last_error = Some(format!(
+                    "Nie udalo sie odswiezyc szczegolow anime {title}: {error}"
+                ));
+                let _ = command_error("user_anime_list_details refresh", error);
+            }
+        }
+
+        save_user_anime_list_refresh_state(state)?;
+        replace_user_anime_list_refresh_status(
+            status,
+            user_anime_list_refresh_status_from_state(state, true),
+        )?;
+    }
+
+    let failed = state.queue.iter().filter(|item| item.failed).count();
+    state.last_finished_at_ms = Some(unix_timestamp_ms_u64());
+    state.last_error = if failed > 0 {
+        Some(format!(
+            "Nie udalo sie odswiezyc szczegolow czesci anime: {failed}"
+        ))
+    } else {
+        None
+    };
+    save_user_anime_list_refresh_state(state)?;
+
+    let final_status = user_anime_list_refresh_status_from_state(state, false);
+    replace_user_anime_list_refresh_status(status, final_status.clone())?;
+    Ok(final_status)
+}
+
+fn build_user_anime_list_refresh_state(
+    cache: &UserAnimeListCache,
+    started_at_ms: u64,
+) -> UserAnimeListRefreshState {
+    let mut queue: Vec<UserAnimeListRefreshQueueItem> = cache
         .items
         .iter()
         .filter(|(_, item)| item.active)
-        .map(|(key, item)| (key.clone(), item.url.clone()))
+        .map(|(key, item)| UserAnimeListRefreshQueueItem {
+            key: key.clone(),
+            title_id: item.title_id,
+            title: item.name.clone(),
+            url: item.url.clone(),
+            done: false,
+            failed: false,
+        })
+        .collect();
+
+    queue.sort_by(|a, b| {
+        a.title
+            .to_ascii_lowercase()
+            .cmp(&b.title.to_ascii_lowercase())
+            .then_with(|| a.title_id.cmp(&b.title_id))
+    });
+
+    UserAnimeListRefreshState {
+        queue,
+        started_at_ms: Some(started_at_ms),
+        last_finished_at_ms: None,
+        last_error: None,
+    }
+}
+
+fn user_anime_list_refresh_state_has_pending(state: &UserAnimeListRefreshState) -> bool {
+    state.queue.iter().any(|item| !item.done && !item.failed)
+}
+
+fn user_anime_list_refresh_status_from_state(
+    state: &UserAnimeListRefreshState,
+    running: bool,
+) -> UserAnimeListRefreshStatus {
+    let total = state.queue.len();
+    let refreshed = state.queue.iter().filter(|item| item.done).count();
+    let failed = state.queue.iter().filter(|item| item.failed).count();
+    let current = refreshed + failed;
+    let remaining = total.saturating_sub(current);
+    let current_title = if running {
+        state
+            .queue
+            .iter()
+            .find(|item| !item.done && !item.failed)
+            .map(|item| item.title.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    UserAnimeListRefreshStatus {
+        running,
+        current,
+        total,
+        remaining,
+        refreshed,
+        failed,
+        current_title,
+        last_finished_at_ms: state.last_finished_at_ms,
+        last_error: state.last_error.clone(),
+    }
+}
+
+async fn refresh_new_user_anime_detail_metadata(
+    api: &ShindenAPI,
+    cache: &mut UserAnimeListCache,
+    keys: Vec<String>,
+    updated_at_ms: u64,
+) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+
+    let targets: Vec<(String, String)> = keys
+        .into_iter()
+        .filter_map(|key| {
+            cache
+                .items
+                .get(&key)
+                .filter(|item| item.active)
+                .map(|item| (key, item.url.clone()))
+        })
         .collect();
 
     let mut errors = 0usize;
     let mut detail_results = stream::iter(targets)
         .map(|(key, url)| async move { (key, api.get_anime_details(&url).await) })
-        .buffer_unordered(DETAIL_REFRESH_CONCURRENCY);
+        .buffer_unordered(USER_ANIME_LIST_DETAIL_REFRESH_CONCURRENCY);
 
     while let Some((key, result)) = detail_results.next().await {
         match result {
@@ -2449,14 +2737,14 @@ async fn refresh_user_anime_detail_metadata(
             }
             Err(error) => {
                 errors += 1;
-                let _ = command_error("user_anime_list_details refresh", error);
+                let _ = command_error("user_anime_list_new_details refresh", error);
             }
         }
     }
 
     if errors > 0 {
         Some(format!(
-            "Nie udalo sie odswiezyc szczegolow czesci anime: {errors}"
+            "Nie udalo sie pobrac szczegolow nowych anime: {errors}"
         ))
     } else {
         None
@@ -2559,6 +2847,25 @@ fn active_user_anime_list_items(cache: &UserAnimeListCache) -> Vec<UserAnimeList
         .collect();
     items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     items
+}
+
+fn user_anime_list_cache_keys(cache: &UserAnimeListCache) -> HashSet<String> {
+    cache.items.keys().cloned().collect()
+}
+
+fn new_active_user_anime_list_cache_keys(
+    cache: &UserAnimeListCache,
+    existing_keys: &HashSet<String>,
+) -> Vec<String> {
+    let mut keys: Vec<String> = cache
+        .items
+        .iter()
+        .filter(|(key, item)| item.active && !existing_keys.contains(*key))
+        .map(|(key, _)| key.clone())
+        .collect();
+
+    keys.sort();
+    keys
 }
 
 fn user_anime_lists_payload(
@@ -2989,6 +3296,39 @@ fn user_anime_list_cache_path() -> PathBuf {
     resolve_project_cache_dir().join("user-anime-lists-cache.json")
 }
 
+fn load_user_anime_list_refresh_state() -> UserAnimeListRefreshState {
+    load_user_anime_list_refresh_state_from(&user_anime_list_refresh_state_path())
+}
+
+fn load_user_anime_list_refresh_state_from(path: &Path) -> UserAnimeListRefreshState {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<UserAnimeListRefreshState>(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn save_user_anime_list_refresh_state(state: &UserAnimeListRefreshState) -> Result<(), String> {
+    save_user_anime_list_refresh_state_to(&user_anime_list_refresh_state_path(), state)
+        .map_err(|e| command_error("user_anime_list_refresh save", e))
+}
+
+fn save_user_anime_list_refresh_state_to(
+    path: &Path,
+    state: &UserAnimeListRefreshState,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let contents = serde_json::to_string_pretty(state)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(path, contents)
+}
+
+fn user_anime_list_refresh_state_path() -> PathBuf {
+    resolve_project_cache_dir().join("user-anime-lists-refresh.json")
+}
+
 fn save_watching_availability_cache_to(
     path: &Path,
     cache: &WatchingAvailabilityCache,
@@ -3057,6 +3397,83 @@ where
     let mut status = lock_refresh_status(status)?;
     update(&mut status);
     Ok(())
+}
+
+fn begin_user_anime_list_refresh(
+    status: &Mutex<UserAnimeListRefreshStatus>,
+    state: Option<&UserAnimeListRefreshState>,
+) -> Result<Option<UserAnimeListRefreshSummary>, String> {
+    let mut status = lock_user_anime_list_refresh_status(status)?;
+    if status.running {
+        return Ok(Some(UserAnimeListRefreshSummary {
+            status: status.clone(),
+            already_running: true,
+        }));
+    }
+
+    let last_finished_at_ms = status.last_finished_at_ms;
+    *status = state
+        .map(|state| user_anime_list_refresh_status_from_state(state, true))
+        .unwrap_or_else(|| UserAnimeListRefreshStatus {
+            running: true,
+            current: 0,
+            total: 0,
+            remaining: 0,
+            refreshed: 0,
+            failed: 0,
+            current_title: String::new(),
+            last_finished_at_ms,
+            last_error: None,
+        });
+
+    Ok(None)
+}
+
+fn lock_user_anime_list_refresh_status(
+    status: &Mutex<UserAnimeListRefreshStatus>,
+) -> Result<std::sync::MutexGuard<'_, UserAnimeListRefreshStatus>, String> {
+    status
+        .lock()
+        .map_err(|_| command_error("user_anime_list_refresh status", "Status lock poisoned"))
+}
+
+fn user_anime_list_refresh_status_snapshot(
+    status: &Mutex<UserAnimeListRefreshStatus>,
+) -> Result<UserAnimeListRefreshStatus, String> {
+    Ok(lock_user_anime_list_refresh_status(status)?.clone())
+}
+
+fn replace_user_anime_list_refresh_status(
+    status: &Mutex<UserAnimeListRefreshStatus>,
+    new_status: UserAnimeListRefreshStatus,
+) -> Result<(), String> {
+    let mut status = lock_user_anime_list_refresh_status(status)?;
+    *status = new_status;
+    Ok(())
+}
+
+fn update_user_anime_list_refresh_status<F>(
+    status: &Mutex<UserAnimeListRefreshStatus>,
+    update: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut UserAnimeListRefreshStatus),
+{
+    let mut status = lock_user_anime_list_refresh_status(status)?;
+    update(&mut status);
+    Ok(())
+}
+
+fn fail_user_anime_list_refresh(
+    status: &Mutex<UserAnimeListRefreshStatus>,
+    error: &str,
+) -> Result<(), String> {
+    update_user_anime_list_refresh_status(status, |status| {
+        status.running = false;
+        status.current_title.clear();
+        status.last_finished_at_ms = Some(unix_timestamp_ms_u64());
+        status.last_error = Some(error.to_string());
+    })
 }
 
 pub fn command_error<E: ToString>(context: &str, error: E) -> String {
@@ -3798,6 +4215,104 @@ mod tests {
         assert_eq!(items[0].title_id, 2);
         assert_eq!(items[0].watch_status, "plan");
         assert!(!cache.items.get("1").expect("cached item").active);
+    }
+
+    #[test]
+    fn user_list_sync_detects_new_active_titles_for_detail_metadata() {
+        let mut cache = UserAnimeListCache::default();
+        cache.items.insert(
+            "1".to_string(),
+            cached_user_anime_fixture(1, "Existing", "completed", true),
+        );
+        let existing_keys = user_anime_list_cache_keys(&cache);
+
+        merge_user_anime_list_cache(
+            &mut cache,
+            vec![
+                watching_item_fixture(1, Some("completed"), Some(0), Some(12)),
+                watching_item_fixture(2, Some("plan"), Some(0), Some(12)),
+            ],
+            false,
+            10_000,
+        );
+
+        assert_eq!(
+            new_active_user_anime_list_cache_keys(&cache, &existing_keys),
+            vec!["2".to_string()]
+        );
+    }
+
+    #[test]
+    fn user_list_refresh_state_queues_only_active_items() {
+        let mut cache = UserAnimeListCache::default();
+        cache.items.insert(
+            "1".to_string(),
+            cached_user_anime_fixture(1, "Active completed", "completed", true),
+        );
+        cache.items.insert(
+            "2".to_string(),
+            cached_user_anime_fixture(2, "Removed completed", "completed", false),
+        );
+        cache.items.insert(
+            "3".to_string(),
+            cached_user_anime_fixture(3, "Active plan", "plan", true),
+        );
+
+        let state = build_user_anime_list_refresh_state(&cache, 20_000);
+        let queued_keys: Vec<&str> = state.queue.iter().map(|item| item.key.as_str()).collect();
+
+        assert_eq!(queued_keys, vec!["1", "3"]);
+        assert_eq!(state.started_at_ms, Some(20_000));
+        assert_eq!(
+            user_anime_list_refresh_status_from_state(&state, false).total,
+            2
+        );
+    }
+
+    #[test]
+    fn user_list_refresh_status_counts_progress_remaining_and_current_title() {
+        let state = UserAnimeListRefreshState {
+            queue: vec![
+                UserAnimeListRefreshQueueItem {
+                    key: "1".to_string(),
+                    title_id: 1,
+                    title: "Done".to_string(),
+                    url: "https://shinden.pl/series/1".to_string(),
+                    done: true,
+                    failed: false,
+                },
+                UserAnimeListRefreshQueueItem {
+                    key: "2".to_string(),
+                    title_id: 2,
+                    title: "Failed".to_string(),
+                    url: "https://shinden.pl/series/2".to_string(),
+                    done: false,
+                    failed: true,
+                },
+                UserAnimeListRefreshQueueItem {
+                    key: "3".to_string(),
+                    title_id: 3,
+                    title: "Pending".to_string(),
+                    url: "https://shinden.pl/series/3".to_string(),
+                    done: false,
+                    failed: false,
+                },
+            ],
+            started_at_ms: Some(10_000),
+            last_finished_at_ms: None,
+            last_error: Some("partial".to_string()),
+        };
+
+        let status = user_anime_list_refresh_status_from_state(&state, true);
+
+        assert!(status.running);
+        assert_eq!(status.current, 2);
+        assert_eq!(status.total, 3);
+        assert_eq!(status.remaining, 1);
+        assert_eq!(status.refreshed, 1);
+        assert_eq!(status.failed, 1);
+        assert_eq!(status.current_title, "Pending");
+        assert_eq!(status.last_error.as_deref(), Some("partial"));
     }
 
     #[test]
