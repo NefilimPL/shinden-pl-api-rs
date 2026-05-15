@@ -1,12 +1,12 @@
+use crate::client::ShindenAPI;
+use crate::details::{
+    AnimeDetails, AnimeRatingUpdate, anime_rating_url, basic_auth_token, normalize_rating_type,
+    rating_update_form,
+};
+use crate::models::{Anime, Episode, Player};
 use futures_util::stream::{self, StreamExt};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, ORIGIN, REFERER};
 use serde::{Deserialize, Serialize};
-use crate::client::ShindenAPI;
-use crate::details::{
-    anime_rating_url, basic_auth_token, normalize_rating_type, rating_update_form, AnimeDetails,
-    AnimeRatingUpdate,
-};
-use crate::models::{Anime, Episode, Player};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -32,7 +32,6 @@ const SHINDEN_TITLE_PLACEHOLDER: &str =
     "https://shinden.pl/res/other/placeholders/title/100x100.jpg";
 const SHINDEN_MAIN_URL: &str = "https://shinden.pl/main";
 const SHINDEN_SEASON_CURRENT_URL: &str = "https://shinden.pl/series/season/current";
-
 
 #[derive(Debug, Deserialize)]
 struct WatchingListApiResponse {
@@ -136,6 +135,10 @@ struct WatchingListApiItem {
     watched_episodes_cnt: Option<String>,
     description_pl: Option<String>,
     description_en: Option<String>,
+    #[serde(default)]
+    release_date: Option<String>,
+    #[serde(default)]
+    year: Option<u16>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -236,6 +239,60 @@ pub struct WatchingAnime {
     pub total_episodes: Option<u32>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UserAnimeListItem {
+    #[serde(rename = "titleId")]
+    pub title_id: u64,
+    pub name: String,
+    pub url: String,
+    pub image_url: String,
+    pub anime_type: String,
+    pub rating: String,
+    pub episodes: String,
+    pub description: String,
+    #[serde(rename = "watchStatus")]
+    pub watch_status: String,
+    #[serde(rename = "isFavourite")]
+    pub is_favourite: u8,
+    #[serde(rename = "watchedEpisodesCount")]
+    pub watched_episodes_count: u32,
+    #[serde(rename = "totalEpisodes")]
+    pub total_episodes: Option<u32>,
+    #[serde(rename = "releaseYear")]
+    pub release_year: Option<u16>,
+    pub active: bool,
+    #[serde(rename = "updatedAtMs")]
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UserAnimeListCounts {
+    pub in_progress: usize,
+    pub completed: usize,
+    pub skip: usize,
+    pub hold: usize,
+    pub dropped: usize,
+    pub plan: usize,
+    pub all: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UserAnimeListsPayload {
+    pub items: Vec<UserAnimeListItem>,
+    pub counts: UserAnimeListCounts,
+    pub refreshed_at_ms: Option<u64>,
+    pub sync_error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct UserAnimeListCache {
+    items: HashMap<String, UserAnimeListItem>,
+    refreshed_at_ms: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchAnime {
@@ -326,7 +383,6 @@ struct WatchedEpisodeChangeInput {
     created_time: String,
 }
 
-
 pub struct ShindenClientBackend {
     api: ShindenAPI,
     refresh_status: Mutex<WatchingCacheRefreshStatus>,
@@ -415,7 +471,8 @@ impl ShindenClientBackend {
     }
 
     pub async fn get_anime_details(&self, url: String) -> Result<AnimeDetails, String> {
-        let details = self.api
+        let details = self
+            .api
             .get_anime_details(&url)
             .await
             .map_err(|e| command_error("get_anime_details", e))?;
@@ -465,6 +522,42 @@ impl ShindenClientBackend {
             .collect())
     }
 
+    pub async fn get_user_anime_lists(
+        &self,
+        force_refresh: Option<bool>,
+    ) -> Result<UserAnimeListsPayload, String> {
+        let force_refresh = force_refresh.unwrap_or(false);
+        let mut cache = load_user_anime_list_cache();
+        let now_ms = unix_timestamp_ms_u64();
+
+        match fetch_all_userlist_items(&self.api, &self.user_id_cache).await {
+            Ok(items) => {
+                let active_items =
+                    merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
+                cache.refreshed_at_ms = Some(now_ms);
+                save_user_anime_list_cache(&cache)?;
+
+                Ok(user_anime_lists_payload(
+                    active_items,
+                    cache.refreshed_at_ms,
+                    None,
+                ))
+            }
+            Err(error) => {
+                let active_items = active_user_anime_list_items(&cache);
+                if active_items.is_empty() {
+                    Err(error)
+                } else {
+                    Ok(user_anime_lists_payload(
+                        active_items,
+                        cache.refreshed_at_ms,
+                        Some(error),
+                    ))
+                }
+            }
+        }
+    }
+
     pub async fn get_episodes_with_progress(
         &self,
         url: String,
@@ -480,7 +573,11 @@ impl ShindenClientBackend {
         let Some(title_id) = title_id.or_else(|| {
             title_id_from_series_url(&url).and_then(|title_id| title_id.parse::<u64>().ok())
         }) else {
-            return Ok(merge_episode_progress(playback_episodes, Vec::new(), total_episodes));
+            return Ok(merge_episode_progress(
+                playback_episodes,
+                Vec::new(),
+                total_episodes,
+            ));
         };
 
         let progress_episodes = match fetch_current_user_id_cached(
@@ -515,7 +612,9 @@ impl ShindenClientBackend {
         status: Option<String>,
         is_favourite: Option<u8>,
     ) -> Result<(), String> {
-        let user_id = fetch_current_user_id_cached(&self.api, &self.user_id_cache, "update_anime_status").await?;
+        let user_id =
+            fetch_current_user_id_cached(&self.api, &self.user_id_cache, "update_anime_status")
+                .await?;
         let current_status = fetch_title_status(&self.api, title_id, &user_id)
             .await
             .unwrap_or_default();
@@ -558,7 +657,9 @@ impl ShindenClientBackend {
             Err(verify_error) => {
                 let _ = append_project_log(
                     "WARNING",
-                    &format!("update_anime_status fallback after failed list verification: {verify_error}"),
+                    &format!(
+                        "update_anime_status fallback after failed list verification: {verify_error}"
+                    ),
                 );
                 post_legacy_anime_status(
                     &self.api,
@@ -603,8 +704,9 @@ impl ShindenClientBackend {
             .get_html(&series_url(update.title_id))
             .await
             .map_err(|e| command_error("update_anime_rating auth", e))?;
-        let auth = basic_auth_token(&page_html)
-            .ok_or_else(|| command_error("update_anime_rating auth", "Shinden auth token missing"))?;
+        let auth = basic_auth_token(&page_html).ok_or_else(|| {
+            command_error("update_anime_rating auth", "Shinden auth token missing")
+        })?;
         let response = self
             .api
             .post_form(
@@ -673,8 +775,14 @@ impl ShindenClientBackend {
             return Ok(summary);
         }
 
-        let refresh_result =
-            refresh_watching_cache_inner(&self.api, &self.refresh_status, &self.user_id_cache, &filter, force).await;
+        let refresh_result = refresh_watching_cache_inner(
+            &self.api,
+            &self.refresh_status,
+            &self.user_id_cache,
+            &filter,
+            force,
+        )
+        .await;
 
         match refresh_result {
             Ok(status) => Ok(WatchingCacheRefreshSummary {
@@ -748,7 +856,10 @@ impl ShindenClientBackend {
     }
 
     pub async fn logout(&self) -> Result<(), String> {
-        self.api.logout().await.map_err(|e| command_error("logout", e))?;
+        self.api
+            .logout()
+            .await
+            .map_err(|e| command_error("logout", e))?;
         clear_cached_user_id(&self.user_id_cache)
     }
 
@@ -874,7 +985,9 @@ async fn fetch_current_user_id_cached(
                 if let Some(user_id) = cached_user_id {
                     let _ = append_project_log(
                         "WARNING",
-                        &format!("Using cached Shinden user id after {context} profile error: {error}"),
+                        &format!(
+                            "Using cached Shinden user id after {context} profile error: {error}"
+                        ),
                     );
                     return Ok(user_id);
                 }
@@ -1134,9 +1247,12 @@ async fn post_legacy_anime_status(
             .error_for_status()
             .map_err(|e| command_error("legacy_update_anime_status response", e))?;
 
-        if let Err(error) = validate_legacy_write_response(response.text().await.map_err(|e| {
-            command_error("legacy_update_anime_status text", e)
-        })?) {
+        if let Err(error) = validate_legacy_write_response(
+            response
+                .text()
+                .await
+                .map_err(|e| command_error("legacy_update_anime_status text", e))?,
+        ) {
             last_error = Some(error);
             continue;
         }
@@ -1186,9 +1302,12 @@ async fn post_legacy_anime_status_delete(
         .error_for_status()
         .map_err(|e| command_error("legacy_delete_anime_status response", e))?;
 
-    validate_legacy_write_response(response.text().await.map_err(|e| {
-        command_error("legacy_delete_anime_status text", e)
-    })?)
+    validate_legacy_write_response(
+        response
+            .text()
+            .await
+            .map_err(|e| command_error("legacy_delete_anime_status text", e))?,
+    )
 }
 
 fn validate_legacy_write_response(response_text: String) -> Result<(), String> {
@@ -1593,9 +1712,7 @@ async fn get_watching_cache_episodes(
         }
     }
 
-    Err(format!(
-        "Nie udalo sie pobrac listy odcinkow: {last_error}"
-    ))
+    Err(format!("Nie udalo sie pobrac listy odcinkow: {last_error}"))
 }
 
 async fn get_watching_cache_players(
@@ -2085,9 +2202,8 @@ fn is_anime_type_token(token: &str) -> bool {
 }
 
 fn episode_token(token: &str) -> Option<String> {
-    let trimmed = token.trim_matches(|character: char| {
-        matches!(character, ',' | '.' | ';' | ':' | ')' | '(')
-    });
+    let trimmed = token
+        .trim_matches(|character: char| matches!(character, ',' | '.' | ';' | ':' | ')' | '('));
     let lower = trimmed.to_ascii_lowercase();
     if lower.ends_with("ep") || lower.ends_with("odc") {
         Some(trimmed.to_string())
@@ -2255,12 +2371,134 @@ fn map_watching_list_item_details(item: WatchingListApiItem) -> Option<WatchingA
         anime_type: item.anime_type.unwrap_or_default(),
         rating: format_rating(item.summary_rating_total.as_deref()),
         episodes: format_episode_progress(item.watched_episodes_cnt.as_deref(), item.episodes),
-        description: item.description_pl.or(item.description_en).unwrap_or_default(),
+        description: item
+            .description_pl
+            .or(item.description_en)
+            .unwrap_or_default(),
         watch_status,
         is_favourite: item.is_favourite.unwrap_or_default(),
         watched_episodes_count,
         total_episodes: item.episodes,
     })
+}
+
+fn map_user_anime_list_item(
+    item: &WatchingListApiItem,
+    updated_at_ms: u64,
+) -> Option<UserAnimeListItem> {
+    let details = map_watching_list_item_details(item.clone())?;
+
+    Some(UserAnimeListItem {
+        title_id: details.title_id,
+        name: details.name,
+        url: details.url,
+        image_url: details.image_url,
+        anime_type: details.anime_type,
+        rating: details.rating,
+        episodes: details.episodes,
+        description: details.description,
+        watch_status: details.watch_status,
+        is_favourite: details.is_favourite,
+        watched_episodes_count: details.watched_episodes_count,
+        total_episodes: details.total_episodes,
+        release_year: item
+            .year
+            .or_else(|| release_year_from_date(item.release_date.as_deref())),
+        active: true,
+        updated_at_ms,
+    })
+}
+
+fn merge_user_anime_list_cache(
+    cache: &mut UserAnimeListCache,
+    incoming_items: Vec<WatchingListApiItem>,
+    force_refresh: bool,
+    updated_at_ms: u64,
+) -> Vec<UserAnimeListItem> {
+    for item in cache.items.values_mut() {
+        item.active = false;
+    }
+
+    for incoming in incoming_items {
+        let cache_key = user_anime_list_cache_key(incoming.title_id);
+        let Some(mapped) = map_user_anime_list_item(&incoming, updated_at_ms) else {
+            continue;
+        };
+
+        if force_refresh || !cache.items.contains_key(&cache_key) {
+            cache.items.insert(cache_key, mapped);
+            continue;
+        }
+
+        if let Some(cached) = cache.items.get_mut(&cache_key) {
+            cached.watch_status = mapped.watch_status;
+            cached.is_favourite = mapped.is_favourite;
+            cached.episodes = mapped.episodes;
+            cached.watched_episodes_count = mapped.watched_episodes_count;
+            cached.total_episodes = mapped.total_episodes;
+            cached.release_year = cached.release_year.or(mapped.release_year);
+            cached.active = true;
+            cached.updated_at_ms = updated_at_ms;
+        }
+    }
+
+    active_user_anime_list_items(cache)
+}
+
+fn active_user_anime_list_items(cache: &UserAnimeListCache) -> Vec<UserAnimeListItem> {
+    let mut items: Vec<UserAnimeListItem> = cache
+        .items
+        .values()
+        .filter(|item| item.active)
+        .cloned()
+        .collect();
+    items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    items
+}
+
+fn user_anime_lists_payload(
+    items: Vec<UserAnimeListItem>,
+    refreshed_at_ms: Option<u64>,
+    sync_error: Option<String>,
+) -> UserAnimeListsPayload {
+    UserAnimeListsPayload {
+        counts: user_anime_list_counts(&items),
+        items,
+        refreshed_at_ms,
+        sync_error,
+    }
+}
+
+fn user_anime_list_counts(items: &[UserAnimeListItem]) -> UserAnimeListCounts {
+    let mut counts = UserAnimeListCounts::default();
+
+    for item in items {
+        match item.watch_status.trim().to_ascii_lowercase().as_str() {
+            "in progress" | "in-progress" | "inprogress" => counts.in_progress += 1,
+            "completed" => counts.completed += 1,
+            "skip" => counts.skip += 1,
+            "hold" => counts.hold += 1,
+            "dropped" => counts.dropped += 1,
+            "plan" => counts.plan += 1,
+            _ => {}
+        }
+    }
+
+    counts.all = items.len();
+    counts
+}
+
+fn release_year_from_date(value: Option<&str>) -> Option<u16> {
+    let value = value?.trim();
+    if value.len() < 4 {
+        return None;
+    }
+
+    value.get(0..4)?.parse::<u16>().ok()
+}
+
+fn user_anime_list_cache_key(title_id: u64) -> String {
+    title_id.to_string()
 }
 
 fn map_watching_list_item(item: WatchingListApiItem) -> Option<Anime> {
@@ -2420,7 +2658,9 @@ fn cache_entry_satisfies_refresh(
         return false;
     }
 
-    if entry.checked_at_ms == 0 || now_ms.saturating_sub(entry.checked_at_ms) > WATCHING_CACHE_TTL_MS {
+    if entry.checked_at_ms == 0
+        || now_ms.saturating_sub(entry.checked_at_ms) > WATCHING_CACHE_TTL_MS
+    {
         return false;
     }
 
@@ -2551,10 +2791,7 @@ fn subtitle_language_key_without_ai(language: &str) -> String {
         return "en".to_string();
     }
 
-    if language == "jp"
-        || language == "ja"
-        || language.contains("jap")
-        || language.contains("japo")
+    if language == "jp" || language == "ja" || language.contains("jap") || language.contains("japo")
     {
         return "jp".to_string();
     }
@@ -2615,6 +2852,36 @@ fn load_watching_availability_cache_from(path: &Path) -> WatchingAvailabilityCac
 fn save_watching_availability_cache(cache: &WatchingAvailabilityCache) -> Result<(), String> {
     save_watching_availability_cache_to(&watching_availability_cache_path(), cache)
         .map_err(|e| command_error("watching_cache save", e))
+}
+
+fn load_user_anime_list_cache() -> UserAnimeListCache {
+    load_user_anime_list_cache_from(&user_anime_list_cache_path())
+}
+
+fn load_user_anime_list_cache_from(path: &Path) -> UserAnimeListCache {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<UserAnimeListCache>(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn save_user_anime_list_cache(cache: &UserAnimeListCache) -> Result<(), String> {
+    save_user_anime_list_cache_to(&user_anime_list_cache_path(), cache)
+        .map_err(|e| command_error("user_anime_list_cache save", e))
+}
+
+fn save_user_anime_list_cache_to(path: &Path, cache: &UserAnimeListCache) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let contents = serde_json::to_string_pretty(cache)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(path, contents)
+}
+
+fn user_anime_list_cache_path() -> PathBuf {
+    resolve_project_cache_dir().join("user-anime-lists-cache.json")
 }
 
 fn save_watching_availability_cache_to(
@@ -2794,7 +3061,10 @@ fn resolve_project_cache_dir() -> PathBuf {
 }
 
 fn find_project_root_from(start: &Path) -> Option<PathBuf> {
-    start.ancestors().find(|path| is_project_root(path)).map(PathBuf::from)
+    start
+        .ancestors()
+        .find(|path| is_project_root(path))
+        .map(PathBuf::from)
 }
 
 fn is_project_root(path: &Path) -> bool {
@@ -2808,7 +3078,12 @@ fn install_panic_logger() {
             .payload()
             .downcast_ref::<&str>()
             .copied()
-            .or_else(|| panic_info.payload().downcast_ref::<String>().map(String::as_str))
+            .or_else(|| {
+                panic_info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+            })
             .unwrap_or("unknown panic payload");
         let location = panic_info
             .location()
@@ -2818,7 +3093,6 @@ fn install_panic_logger() {
         previous_hook(panic_info);
     }));
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2869,6 +3143,33 @@ mod tests {
             watched_episodes_cnt: Some("3".to_string()),
             description_pl: Some("Opis".to_string()),
             description_en: None,
+            release_date: None,
+            year: None,
+        }
+    }
+
+    fn cached_user_anime_fixture(
+        title_id: u64,
+        name: &str,
+        watch_status: &str,
+        active: bool,
+    ) -> UserAnimeListItem {
+        UserAnimeListItem {
+            title_id,
+            name: name.to_string(),
+            url: series_url(title_id),
+            image_url: SHINDEN_TITLE_PLACEHOLDER.to_string(),
+            anime_type: "TV".to_string(),
+            rating: "7,00".to_string(),
+            episodes: "1/12".to_string(),
+            description: "Cached description".to_string(),
+            watch_status: watch_status.to_string(),
+            is_favourite: 0,
+            watched_episodes_count: 1,
+            total_episodes: Some(12),
+            release_year: Some(2024),
+            active,
+            updated_at_ms: 5_000,
         }
     }
 
@@ -2916,10 +3217,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title_id, Some(59922));
-        assert_eq!(
-            rows[0].name,
-            "Enen no Shouboutai: San no Shou Part 2"
-        );
+        assert_eq!(rows[0].name, "Enen no Shouboutai: San no Shou Part 2");
         assert_eq!(
             rows[0].url,
             "https://shinden.pl/series/59922-enen-no-shouboutai-san-no-shou-part-2"
@@ -2967,10 +3265,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title_id, Some(60001));
-        assert_eq!(
-            rows[0].name,
-            "Jujutsu Kaisen: Shimetsu Kaiyuu - Zenpen"
-        );
+        assert_eq!(rows[0].name, "Jujutsu Kaisen: Shimetsu Kaiyuu - Zenpen");
         assert_eq!(rows[0].anime_type, "TV");
         assert_eq!(rows[0].episodes, "12ep");
         assert_eq!(rows[0].rating, "8,7");
@@ -3002,6 +3297,8 @@ mod tests {
             watched_episodes_cnt: Some("0".to_string()),
             description_pl: None,
             description_en: None,
+            release_date: None,
+            year: None,
         }];
 
         let mapped = map_discovery_anime_results(rows, watching_items);
@@ -3074,8 +3371,7 @@ mod tests {
 
     #[test]
     fn write_log_command_discards_log_file_path() {
-        let result: Result<(), String> =
-            discard_log_path(Ok(PathBuf::from("shinden-client.log")));
+        let result: Result<(), String> = discard_log_path(Ok(PathBuf::from("shinden-client.log")));
 
         assert_eq!(result, Ok(()));
     }
@@ -3096,7 +3392,10 @@ mod tests {
     fn extract_shinden_basic_auth_reads_storage_token() {
         let html = r#"<script>_Storage.basic = "token-123";</script>"#;
 
-        assert_eq!(extract_shinden_basic_auth(html).as_deref(), Some("token-123"));
+        assert_eq!(
+            extract_shinden_basic_auth(html).as_deref(),
+            Some("token-123")
+        );
     }
 
     #[test]
@@ -3113,13 +3412,22 @@ mod tests {
             shinden_watch_status_value(Some("completed")).unwrap(),
             Some("completed")
         );
-        assert_eq!(shinden_watch_status_value(Some("skip")).unwrap(), Some("skip"));
-        assert_eq!(shinden_watch_status_value(Some("hold")).unwrap(), Some("hold"));
+        assert_eq!(
+            shinden_watch_status_value(Some("skip")).unwrap(),
+            Some("skip")
+        );
+        assert_eq!(
+            shinden_watch_status_value(Some("hold")).unwrap(),
+            Some("hold")
+        );
         assert_eq!(
             shinden_watch_status_value(Some("dropped")).unwrap(),
             Some("dropped")
         );
-        assert_eq!(shinden_watch_status_value(Some("plan")).unwrap(), Some("plan"));
+        assert_eq!(
+            shinden_watch_status_value(Some("plan")).unwrap(),
+            Some("plan")
+        );
         assert_eq!(shinden_watch_status_value(Some("no")).unwrap(), None);
         assert_eq!(shinden_watch_status_value(None).unwrap(), None);
     }
@@ -3150,9 +3458,11 @@ mod tests {
             shinden_legacy_watch_status_values(Some("completed")).unwrap(),
             vec!["completed", "watched"]
         );
-        assert!(shinden_legacy_watch_status_values(Some("no"))
-            .unwrap()
-            .is_empty());
+        assert!(
+            shinden_legacy_watch_status_values(Some("no"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3180,8 +3490,8 @@ mod tests {
 
     #[test]
     fn title_status_payload_serializes_no_status_as_null() {
-        let payload = build_title_status_payload(59922, Some("no"), None)
-            .expect("payload should build");
+        let payload =
+            build_title_status_payload(59922, Some("no"), None).expect("payload should build");
         let value = serde_json::to_value(payload).expect("payload should serialize");
 
         assert!(value["input"][0]["watchStatus"].is_null());
@@ -3203,12 +3513,8 @@ mod tests {
 
     #[test]
     fn watched_episode_payload_serializes_single_episode() {
-        let payload = build_watched_episode_payload(
-            59922,
-            168519,
-            "2026-05-03 00:45:10".to_string(),
-            1,
-        );
+        let payload =
+            build_watched_episode_payload(59922, 168519, "2026-05-03 00:45:10".to_string(), 1);
         let value = serde_json::to_value(payload).expect("payload should serialize");
 
         assert_eq!(value["titleId"], 59922);
@@ -3219,12 +3525,8 @@ mod tests {
 
     #[test]
     fn watched_episode_payload_serializes_unwatched_episode() {
-        let payload = build_watched_episode_payload(
-            59922,
-            168519,
-            "2026-05-03 00:45:10".to_string(),
-            0,
-        );
+        let payload =
+            build_watched_episode_payload(59922, 168519, "2026-05-03 00:45:10".to_string(), 0);
         let value = serde_json::to_value(payload).expect("payload should serialize");
 
         assert_eq!(value["titleId"], 59922);
@@ -3247,6 +3549,8 @@ mod tests {
             watched_episodes_cnt: Some("3".to_string()),
             description_pl: Some("Opis".to_string()),
             description_en: None,
+            release_date: None,
+            year: None,
         };
 
         let anime = map_watching_list_item(item).expect("item should map");
@@ -3277,6 +3581,8 @@ mod tests {
             watched_episodes_cnt: Some("3".to_string()),
             description_pl: Some("Opis".to_string()),
             description_en: None,
+            release_date: None,
+            year: None,
         };
 
         let anime = map_watching_list_item_details(item).expect("item should map");
@@ -3290,6 +3596,72 @@ mod tests {
         assert_eq!(anime.episodes, "3/12");
         assert_eq!(anime.watched_episodes_count, 3);
         assert_eq!(anime.total_episodes, Some(12));
+    }
+
+    #[test]
+    fn user_list_normal_sync_preserves_cached_metadata_and_updates_status() {
+        let mut cache = UserAnimeListCache::default();
+        cache.items.insert(
+            "59922".to_string(),
+            cached_user_anime_fixture(59922, "Old Title", "in progress", true),
+        );
+
+        let items = merge_user_anime_list_cache(
+            &mut cache,
+            vec![watching_item_fixture(
+                59922,
+                Some("completed"),
+                Some(1),
+                Some(24),
+            )],
+            false,
+            10_000,
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Old Title");
+        assert_eq!(items[0].watch_status, "completed");
+        assert_eq!(items[0].is_favourite, 1);
+        assert_eq!(items[0].total_episodes, Some(24));
+        assert_eq!(items[0].updated_at_ms, 10_000);
+    }
+
+    #[test]
+    fn user_list_force_refresh_overwrites_cached_metadata() {
+        let mut cache = UserAnimeListCache::default();
+        cache.items.insert(
+            "59922".to_string(),
+            cached_user_anime_fixture(59922, "Old Title", "in progress", true),
+        );
+
+        let mut incoming = watching_item_fixture(59922, Some("completed"), Some(1), Some(12));
+        incoming.title = "Fresh Title".to_string();
+        let items = merge_user_anime_list_cache(&mut cache, vec![incoming], true, 10_000);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Fresh Title");
+        assert_eq!(items[0].watch_status, "completed");
+    }
+
+    #[test]
+    fn user_list_sync_inserts_new_titles_and_hides_removed_titles() {
+        let mut cache = UserAnimeListCache::default();
+        cache.items.insert(
+            "1".to_string(),
+            cached_user_anime_fixture(1, "Removed", "completed", true),
+        );
+
+        let items = merge_user_anime_list_cache(
+            &mut cache,
+            vec![watching_item_fixture(2, Some("plan"), Some(0), Some(12))],
+            false,
+            10_000,
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title_id, 2);
+        assert_eq!(items[0].watch_status, "plan");
+        assert!(!cache.items.get("1").expect("cached item").active);
     }
 
     #[test]
@@ -3312,7 +3684,9 @@ mod tests {
     #[test]
     fn map_search_anime_results_uses_matching_watching_status() {
         let results = map_search_anime_results(
-            vec![anime_fixture("https://shinden.pl/titles/59922-enen-no-shouboutai")],
+            vec![anime_fixture(
+                "https://shinden.pl/titles/59922-enen-no-shouboutai",
+            )],
             vec![watching_item_fixture(
                 59922,
                 Some("completed"),
@@ -3423,7 +3797,10 @@ mod tests {
                 .as_deref(),
             Some("59922")
         );
-        assert_eq!(title_id_from_series_url("https://shinden.pl/titles/abc"), None);
+        assert_eq!(
+            title_id_from_series_url("https://shinden.pl/titles/abc"),
+            None
+        );
     }
 
     #[test]
@@ -3517,6 +3894,8 @@ mod tests {
             watched_episodes_cnt: watched.map(str::to_string),
             description_pl: None,
             description_en: None,
+            release_date: None,
+            year: None,
         }
     }
 
@@ -3680,7 +4059,10 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(selected_subtitle_cache_key(&filter).as_deref(), Some("pl:human"));
+        assert_eq!(
+            selected_subtitle_cache_key(&filter).as_deref(),
+            Some("pl:human")
+        );
     }
 
     #[test]
