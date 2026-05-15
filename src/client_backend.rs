@@ -260,6 +260,10 @@ pub struct UserAnimeListItem {
     pub total_episodes: Option<u32>,
     #[serde(rename = "releaseYear")]
     pub release_year: Option<u16>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, rename = "ageRating")]
+    pub age_rating: Option<String>,
     pub active: bool,
     #[serde(rename = "updatedAtMs")]
     pub updated_at_ms: u64,
@@ -532,15 +536,20 @@ impl ShindenClientBackend {
 
         match fetch_all_userlist_items(&self.api, &self.user_id_cache).await {
             Ok(items) => {
-                let active_items =
-                    merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
+                merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
+                let sync_error = if force_refresh {
+                    refresh_user_anime_detail_metadata(&self.api, &mut cache, now_ms).await
+                } else {
+                    None
+                };
+                let active_items = active_user_anime_list_items(&cache);
                 cache.refreshed_at_ms = Some(now_ms);
                 save_user_anime_list_cache(&cache)?;
 
                 Ok(user_anime_lists_payload(
                     active_items,
                     cache.refreshed_at_ms,
-                    None,
+                    sync_error,
                 ))
             }
             Err(error) => {
@@ -2404,9 +2413,98 @@ fn map_user_anime_list_item(
         release_year: item
             .year
             .or_else(|| release_year_from_date(item.release_date.as_deref())),
+        tags: Vec::new(),
+        age_rating: None,
         active: true,
         updated_at_ms,
     })
+}
+
+async fn refresh_user_anime_detail_metadata(
+    api: &ShindenAPI,
+    cache: &mut UserAnimeListCache,
+    updated_at_ms: u64,
+) -> Option<String> {
+    const DETAIL_REFRESH_CONCURRENCY: usize = 4;
+
+    let targets: Vec<(String, String)> = cache
+        .items
+        .iter()
+        .filter(|(_, item)| item.active)
+        .map(|(key, item)| (key.clone(), item.url.clone()))
+        .collect();
+
+    let mut errors = 0usize;
+    let mut detail_results = stream::iter(targets)
+        .map(|(key, url)| async move { (key, api.get_anime_details(&url).await) })
+        .buffer_unordered(DETAIL_REFRESH_CONCURRENCY);
+
+    while let Some((key, result)) = detail_results.next().await {
+        match result {
+            Ok(details) => {
+                if let Some(item) = cache.items.get_mut(&key) {
+                    apply_user_anime_details_to_item(item, &details);
+                    item.updated_at_ms = updated_at_ms;
+                }
+            }
+            Err(error) => {
+                errors += 1;
+                let _ = command_error("user_anime_list_details refresh", error);
+            }
+        }
+    }
+
+    if errors > 0 {
+        Some(format!(
+            "Nie udalo sie odswiezyc szczegolow czesci anime: {errors}"
+        ))
+    } else {
+        None
+    }
+}
+
+fn apply_user_anime_details_to_item(item: &mut UserAnimeListItem, details: &AnimeDetails) {
+    if !details.name.trim().is_empty() {
+        item.name = details.name.clone();
+    }
+    if !details.image_url.trim().is_empty() {
+        item.image_url = details.image_url.clone();
+    }
+    if !details.description.trim().is_empty() {
+        item.description = details.description.clone();
+    }
+
+    item.tags = anime_detail_tags(details);
+    item.age_rating = anime_detail_age_rating(details);
+}
+
+fn anime_detail_tags(details: &AnimeDetails) -> Vec<String> {
+    let mut tags = Vec::new();
+
+    for group in &details.categories {
+        for tag in &group.items {
+            let tag = tag.trim();
+            if tag.is_empty() || tags.iter().any(|existing| existing == tag) {
+                continue;
+            }
+
+            tags.push(tag.to_string());
+        }
+    }
+
+    tags
+}
+
+fn anime_detail_age_rating(details: &AnimeDetails) -> Option<String> {
+    details
+        .information
+        .iter()
+        .find(|row| {
+            let label = row.label.trim_end_matches(':').trim().to_ascii_lowercase();
+            label.contains("wiek")
+        })
+        .map(|row| row.value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn merge_user_anime_list_cache(
@@ -2426,6 +2524,13 @@ fn merge_user_anime_list_cache(
         };
 
         if force_refresh || !cache.items.contains_key(&cache_key) {
+            let mut mapped = mapped;
+            if force_refresh {
+                if let Some(existing) = cache.items.get(&cache_key) {
+                    mapped.tags = existing.tags.clone();
+                    mapped.age_rating = existing.age_rating.clone();
+                }
+            }
             cache.items.insert(cache_key, mapped);
             continue;
         }
@@ -3096,6 +3201,8 @@ fn install_panic_logger() {
 
 #[cfg(test)]
 mod tests {
+    use crate::details::{AnimeCategoryGroup, AnimeInfoRow};
+
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3168,6 +3275,8 @@ mod tests {
             watched_episodes_count: 1,
             total_episodes: Some(12),
             release_year: Some(2024),
+            tags: Vec::new(),
+            age_rating: None,
             active,
             updated_at_ms: 5_000,
         }
@@ -3641,6 +3750,33 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "Fresh Title");
         assert_eq!(items[0].watch_status, "completed");
+    }
+
+    #[test]
+    fn user_list_details_add_tags_and_age_rating_to_cached_item() {
+        let mut item = cached_user_anime_fixture(59922, "Old Title", "in progress", true);
+        let details = AnimeDetails {
+            categories: vec![
+                AnimeCategoryGroup {
+                    label: "Gatunki:".to_string(),
+                    items: vec!["Komedia".to_string(), "Fantasy".to_string()],
+                },
+                AnimeCategoryGroup {
+                    label: "Pierwowzor:".to_string(),
+                    items: vec!["Manga".to_string(), "Fantasy".to_string()],
+                },
+            ],
+            information: vec![AnimeInfoRow {
+                label: "Kategoria wiekowa:".to_string(),
+                value: "R17+".to_string(),
+            }],
+            ..AnimeDetails::default()
+        };
+
+        apply_user_anime_details_to_item(&mut item, &details);
+
+        assert_eq!(item.tags, vec!["Komedia", "Fantasy", "Manga"]);
+        assert_eq!(item.age_rating.as_deref(), Some("R17+"));
     }
 
     #[test]

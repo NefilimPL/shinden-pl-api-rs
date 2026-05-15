@@ -101,6 +101,8 @@ fn frontend_contract_types_keep_expected_json_shape() {
         watched_episodes_count: 2,
         total_episodes: Some(12),
         release_year: Some(2025),
+        tags: vec!["Komedia".to_string(), "Fantasy".to_string()],
+        age_rating: Some("R17+".to_string()),
         active: true,
         updated_at_ms: 10,
     };
@@ -123,6 +125,8 @@ fn frontend_contract_types_keep_expected_json_shape() {
     assert_eq!(json["items"][0]["titleId"], 59922);
     assert_eq!(json["items"][0]["watchStatus"], "in progress");
     assert_eq!(json["items"][0]["releaseYear"], 2025);
+    assert_eq!(json["items"][0]["tags"][0], "Komedia");
+    assert_eq!(json["items"][0]["ageRating"], "R17+");
     assert_eq!(json["counts"]["inProgress"], 1);
     assert_eq!(json["counts"]["all"], 1);
 }
