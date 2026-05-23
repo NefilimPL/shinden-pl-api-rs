@@ -1,5 +1,7 @@
 use shinden_pl_api::client_backend::{
-    DiscoveryAnime, EpisodeProgress, ShindenClientBackend, WatchingAnime, WatchingAnimeFilter,
+    DiscoveryAnime, EpisodeProgress, ShindenClientBackend, UserAnimeListCounts, UserAnimeListItem,
+    UserAnimeListRefreshStatus, UserAnimeListRefreshSummary, UserAnimeListsPayload, WatchingAnime,
+    WatchingAnimeFilter,
 };
 
 #[test]
@@ -85,4 +87,72 @@ fn frontend_contract_types_keep_expected_json_shape() {
     assert_eq!(filter_json["subtitleLanguage"], "PL");
     assert_eq!(filter_json["checkSubtitleAvailabilityOnline"], true);
     assert_eq!(filter_json["excludeAiSubtitles"], true);
+
+    let user_list_item = UserAnimeListItem {
+        title_id: 59922,
+        name: "Enen no Shouboutai".to_string(),
+        url: "https://shinden.pl/series/59922".to_string(),
+        image_url: "https://cdn.shinden.eu/cdn1/images/genuine/59922.jpg".to_string(),
+        anime_type: "TV".to_string(),
+        rating: "8.10".to_string(),
+        episodes: "2/12".to_string(),
+        description: "Fire force".to_string(),
+        watch_status: "in progress".to_string(),
+        is_favourite: 1,
+        watched_episodes_count: 2,
+        total_episodes: Some(12),
+        release_year: Some(2025),
+        tags: vec!["Komedia".to_string(), "Fantasy".to_string()],
+        age_rating: Some("R17+".to_string()),
+        active: true,
+        updated_at_ms: 10,
+    };
+    let payload = UserAnimeListsPayload {
+        items: vec![user_list_item],
+        counts: UserAnimeListCounts {
+            in_progress: 1,
+            completed: 0,
+            skip: 0,
+            hold: 0,
+            dropped: 0,
+            plan: 0,
+            all: 1,
+        },
+        refreshed_at_ms: Some(10),
+        sync_error: None,
+    };
+    let json = serde_json::to_value(payload).expect("payload serializes");
+
+    assert_eq!(json["items"][0]["titleId"], 59922);
+    assert_eq!(json["items"][0]["watchStatus"], "in progress");
+    assert_eq!(json["items"][0]["releaseYear"], 2025);
+    assert_eq!(json["items"][0]["tags"][0], "Komedia");
+    assert_eq!(json["items"][0]["ageRating"], "R17+");
+    assert_eq!(json["counts"]["inProgress"], 1);
+    assert_eq!(json["counts"]["all"], 1);
+
+    let refresh_status = UserAnimeListRefreshStatus {
+        running: true,
+        current: 2,
+        total: 5,
+        remaining: 3,
+        refreshed: 2,
+        failed: 0,
+        current_title: "Season show".to_string(),
+        last_finished_at_ms: None,
+        last_error: None,
+    };
+    let refresh_summary = UserAnimeListRefreshSummary {
+        status: refresh_status,
+        already_running: true,
+    };
+    let refresh_json =
+        serde_json::to_value(refresh_summary).expect("user list refresh summary serializes");
+
+    assert_eq!(refresh_json["alreadyRunning"], true);
+    assert_eq!(refresh_json["status"]["running"], true);
+    assert_eq!(refresh_json["status"]["current"], 2);
+    assert_eq!(refresh_json["status"]["total"], 5);
+    assert_eq!(refresh_json["status"]["remaining"], 3);
+    assert_eq!(refresh_json["status"]["currentTitle"], "Season show");
 }
