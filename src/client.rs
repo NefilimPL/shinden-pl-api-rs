@@ -56,6 +56,18 @@ impl ShindenAPI {
         save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
         Ok(body)
     }
+    pub async fn resolve_final_url(&self, url: &str) -> Result<String> {
+        let headers = get_headers_for_type(RequestType::Frontend, Some(url))?;
+        let response = self.client.get(url)
+            .headers(headers)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let resolved_url = response.url().to_string();
+        save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        Ok(resolved_url)
+    }
 
     pub async fn post_form(&self, url: &str, form: &[(String, String)], custom_headers: Option<reqwest::header::HeaderMap>) -> Result<String> {
         let mut headers = get_headers_for_type(RequestType::Login, Some(url))?;
