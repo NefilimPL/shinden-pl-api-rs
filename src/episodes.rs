@@ -56,7 +56,10 @@ fn episode_page_url(series_url: &str) -> String {
 }
 
 fn requires_series_url_resolution(link: &str) -> bool {
-    let Some((_, path)) = link.split_once("/series/") else {
+    let path = link
+        .split_once("/series/")
+        .or_else(|| link.split_once("/titles/"));
+    let Some((_, path)) = path else {
         return false;
     };
     let segment = path.split('/').next().unwrap_or_default().split('?').next().unwrap_or_default();
@@ -77,6 +80,7 @@ mod tests {
     #[test]
     fn resolves_slugless_series_urls_before_loading_episodes() {
         assert!(requires_series_url_resolution("https://shinden.pl/series/71632"));
+        assert!(requires_series_url_resolution("https://shinden.pl/titles/68581"));
         assert!(!requires_series_url_resolution("https://shinden.pl/series/71632-kokoore"));
     }
 }

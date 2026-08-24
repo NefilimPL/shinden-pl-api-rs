@@ -572,12 +572,26 @@ impl ShindenClientBackend {
         let filter = filter.unwrap_or_default();
         let cache = load_watching_availability_cache();
         let items = fetch_all_watching_items(&self.api, &self.user_id_cache).await?;
+        let canonical_urls = cached_canonical_title_urls(&load_user_anime_list_cache());
+        let mut anime = Vec::new();
 
-        Ok(items
+        for item in items
             .into_iter()
             .filter(|item| watching_cache_filter_matches(item, &filter, &cache))
-            .filter_map(map_watching_list_item_details)
-            .collect())
+        {
+            let url = match canonical_urls.get(&item.title_id) {
+                Some(url) => url.clone(),
+                None => resolve_canonical_title_url(&self.api, &item)
+                    .await
+                    .unwrap_or_else(|_| series_url(item.title_id)),
+            };
+
+            if let Some(item) = map_watching_list_item_details_with_url(item, url) {
+                anime.push(item);
+            }
+        }
+
+        Ok(anime)
     }
 
     pub async fn get_user_anime_lists(
@@ -591,7 +605,9 @@ impl ShindenClientBackend {
         match fetch_all_userlist_items(&self.api, &self.user_id_cache).await {
             Ok(items) => {
                 let existing_keys = user_anime_list_cache_keys(&cache);
+                let canonical_urls = resolve_canonical_title_urls(&self.api, &items).await;
                 merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
+                apply_canonical_title_urls(&mut cache, &canonical_urls);
                 let new_keys = new_active_user_anime_list_cache_keys(&cache, &existing_keys);
                 let sync_error = refresh_new_user_anime_detail_metadata(
                     &self.api,
@@ -1778,7 +1794,7 @@ async fn scan_watching_item_availability(
     subtitle_cache_key: Option<&str>,
     _exclude_ai_subtitles: bool,
 ) -> Result<WatchingAvailabilityCacheEntry, String> {
-    let series_url = series_url(item.title_id);
+    let series_url = resolve_canonical_title_url(api, item).await?;
     let episodes = get_watching_cache_episodes(api, &series_url).await?;
     let watched_count = watched_episode_count(item) as usize;
     let mut has_available_unwatched_episode = false;
@@ -1971,6 +1987,75 @@ fn series_url(title_id: u64) -> String {
 fn rating_response_is_success(response: &str) -> bool {
     let normalized = response.trim().to_ascii_lowercase();
     normalized == "ok" || normalized.contains("\"success\":true")
+}
+
+fn canonical_title_url_from_search_results(title_id: u64, results: &[Anime]) -> Option<String> {
+    results
+        .iter()
+        .find(|anime| {
+            title_id_from_series_url(&anime.url)
+                .and_then(|value| value.parse::<u64>().ok())
+                == Some(title_id)
+        })
+        .map(|anime| anime.url.clone())
+}
+
+async fn resolve_canonical_title_url(
+    api: &ShindenAPI,
+    item: &WatchingListApiItem,
+) -> Result<String, String> {
+    let results = api
+        .search_anime(&item.title)
+        .await
+        .map_err(|error| command_error("resolve_canonical_title_url search", error))?;
+
+    canonical_title_url_from_search_results(item.title_id, &results).ok_or_else(|| {
+        command_error(
+            "resolve_canonical_title_url result",
+            format!("No search result matched title ID {}", item.title_id),
+        )
+    })
+}
+
+async fn resolve_canonical_title_urls(
+    api: &ShindenAPI,
+    items: &[WatchingListApiItem],
+) -> HashMap<u64, String> {
+    let mut pending = stream::iter(items.iter().cloned().map(|item| async move {
+        let title_id = item.title_id;
+        (title_id, resolve_canonical_title_url(api, &item).await)
+    }))
+    .buffer_unordered(USER_ANIME_LIST_DETAIL_REFRESH_CONCURRENCY);
+    let mut urls = HashMap::new();
+
+    while let Some((title_id, result)) = pending.next().await {
+        if let Ok(url) = result {
+            urls.insert(title_id, url);
+        }
+    }
+
+    urls
+}
+
+fn is_canonical_title_url(url: &str, title_id: u64) -> bool {
+    ["/series/", "/titles/"]
+        .iter()
+        .filter_map(|marker| url.split_once(marker).map(|(_, path)| path))
+        .any(|path| {
+            let segment = path.split('/').next().unwrap_or_default();
+            segment
+                .strip_prefix(&title_id.to_string())
+                .is_some_and(|suffix| suffix.starts_with('-'))
+        })
+}
+
+fn cached_canonical_title_urls(cache: &UserAnimeListCache) -> HashMap<u64, String> {
+    cache
+        .items
+        .values()
+        .filter(|item| item.active && is_canonical_title_url(&item.url, item.title_id))
+        .map(|item| (item.title_id, item.url.clone()))
+        .collect()
 }
 
 fn title_id_from_series_url(url: &str) -> Option<String> {
@@ -2498,6 +2583,14 @@ fn build_watched_episode_payload(
 }
 
 fn map_watching_list_item_details(item: WatchingListApiItem) -> Option<WatchingAnime> {
+    let url = series_url(item.title_id);
+    map_watching_list_item_details_with_url(item, url)
+}
+
+fn map_watching_list_item_details_with_url(
+    item: WatchingListApiItem,
+    url: String,
+) -> Option<WatchingAnime> {
     let name = item.title.trim().to_string();
     if name.is_empty() {
         return None;
@@ -2513,7 +2606,7 @@ fn map_watching_list_item_details(item: WatchingListApiItem) -> Option<WatchingA
     Some(WatchingAnime {
         title_id: item.title_id,
         name,
-        url: series_url(item.title_id),
+        url,
         image_url: item
             .cover_id
             .map(|cover_id| format!("https://cdn.shinden.eu/cdn1/images/genuine/{cover_id}.jpg"))
@@ -2569,8 +2662,10 @@ async fn refresh_user_anime_list_cache_inner(
     let mut cache = load_user_anime_list_cache();
     let now_ms = unix_timestamp_ms_u64();
     let items = fetch_all_userlist_items(api, user_id_cache).await?;
+    let canonical_urls = resolve_canonical_title_urls(api, &items).await;
 
     merge_user_anime_list_cache(&mut cache, items, true, now_ms);
+    apply_canonical_title_urls(&mut cache, &canonical_urls);
     cache.refreshed_at_ms = Some(now_ms);
     save_user_anime_list_cache(&cache)?;
 
@@ -2807,7 +2902,7 @@ fn anime_detail_age_rating(details: &AnimeDetails) -> Option<String> {
         .iter()
         .find(|row| {
             let label = row.label.trim_end_matches(':').trim().to_ascii_lowercase();
-            label.contains("wiek")
+            label.contains("wiek") || label == "mpaa"
         })
         .map(|row| row.value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -2852,7 +2947,6 @@ fn merge_user_anime_list_cache(
             cached.updated_at_ms = updated_at_ms;
         }
     }
-
     active_user_anime_list_items(cache)
 }
 
@@ -2865,6 +2959,15 @@ fn active_user_anime_list_items(cache: &UserAnimeListCache) -> Vec<UserAnimeList
         .collect();
     items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     items
+}
+
+
+fn apply_canonical_title_urls(cache: &mut UserAnimeListCache, urls: &HashMap<u64, String>) {
+    for (title_id, url) in urls {
+        if let Some(item) = cache.items.get_mut(&user_anime_list_cache_key(*title_id)) {
+            item.url = url.clone();
+        }
+    }
 }
 
 fn user_anime_list_cache_keys(cache: &UserAnimeListCache) -> HashSet<String> {
@@ -4220,6 +4323,19 @@ mod tests {
     }
 
     #[test]
+    fn anime_detail_age_rating_reads_mpaa_label() {
+        let details = AnimeDetails {
+            information: vec![AnimeInfoRow {
+                label: "MPAA:".to_string(),
+                value: "PG-13".to_string(),
+            }],
+            ..AnimeDetails::default()
+        };
+
+        assert_eq!(anime_detail_age_rating(&details).as_deref(), Some("PG-13"));
+    }
+
+    #[test]
     fn user_list_sync_inserts_new_titles_and_hides_removed_titles() {
         let mut cache = UserAnimeListCache::default();
         cache.items.insert(
@@ -4452,6 +4568,19 @@ mod tests {
         assert_eq!(
             legacy_userlist_series_url("31875", 59922),
             "https://shinden.pl/api/userlist/31875/series/59922"
+        );
+    }
+
+    #[test]
+    fn canonical_title_url_selects_the_result_matching_the_exact_title_id() {
+        let results = vec![
+            anime_fixture("https://shinden.pl/series/69862-bye-bye-earth"),
+            anime_fixture("https://shinden.pl/series/68581-bye-bye-earth-2nd-season"),
+        ];
+
+        assert_eq!(
+            canonical_title_url_from_search_results(68581, &results).as_deref(),
+            Some("https://shinden.pl/series/68581-bye-bye-earth-2nd-season"),
         );
     }
 
