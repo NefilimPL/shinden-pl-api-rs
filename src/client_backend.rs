@@ -188,6 +188,15 @@ struct WatchingAvailabilityCacheEntry {
 
 #[derive(Debug, Serialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct WatchingCacheFailure {
+    pub title_id: u64,
+    pub title: String,
+    pub series_url: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct WatchingCacheRefreshStatus {
     pub running: bool,
     pub current: usize,
@@ -195,6 +204,7 @@ pub struct WatchingCacheRefreshStatus {
     pub refreshed: usize,
     pub skipped: usize,
     pub failed: usize,
+    pub failures: Vec<WatchingCacheFailure>,
     pub current_title: String,
     pub last_finished_at_ms: Option<u64>,
     pub last_error: Option<String>,
@@ -1572,6 +1582,7 @@ async fn refresh_watching_cache_inner(
     let mut scan_results = stream::iter(plan.items_to_scan.into_iter().map(|item| async move {
         let cache_key = watching_cache_key(item.title_id);
         let item_title = item.title.clone();
+        let title_id = item.title_id;
         let result = scan_watching_item_availability(
             api,
             &item,
@@ -1581,11 +1592,11 @@ async fn refresh_watching_cache_inner(
         )
         .await;
 
-        (cache_key, item_title, result)
+        (cache_key, item_title, title_id, result)
     }))
     .buffer_unordered(WATCHING_CACHE_REFRESH_CONCURRENCY);
 
-    while let Some((cache_key, item_title, scan_result)) = scan_results.next().await {
+    while let Some((cache_key, item_title, title_id, scan_result)) = scan_results.next().await {
         update_refresh_status(status, |status| {
             status.current += 1;
             status.current_title = item_title.clone();
@@ -1602,8 +1613,15 @@ async fn refresh_watching_cache_inner(
             Err(error) => {
                 let visible_error = watching_cache_item_error_message(&item_title);
                 let _ = command_error("watching_cache item", format!("{visible_error}: {error}"));
+                let failure = WatchingCacheFailure {
+                    title_id,
+                    title: item_title.clone(),
+                    series_url: series_url(title_id),
+                    reason: error.to_string(),
+                };
                 update_refresh_status(status, |status| {
                     status.failed += 1;
+                    status.failures.push(failure);
                     status.last_error = Some(visible_error);
                 })?;
             }
@@ -3369,6 +3387,7 @@ fn begin_watching_cache_refresh(
         refreshed: 0,
         skipped: 0,
         failed: 0,
+        failures: Vec::new(),
         current_title: String::new(),
         last_finished_at_ms,
         last_error: None,
@@ -4620,6 +4639,20 @@ mod tests {
     #[test]
     fn watching_cache_refresh_scans_four_titles_concurrently() {
         assert_eq!(WATCHING_CACHE_REFRESH_CONCURRENCY, 4);
+    }
+
+    #[test]
+    fn watching_cache_failure_serializes_title_link_and_reason() {
+        let failure = WatchingCacheFailure {
+            title_id: 71632,
+            title: "Kokoore".to_string(),
+            series_url: "https://shinden.pl/series/71632".to_string(),
+            reason: "HTTP 404".to_string(),
+        };
+        let value = serde_json::to_value(failure).expect("failure serializes");
+
+        assert_eq!(value["titleId"], 71632);
+        assert_eq!(value["reason"], "HTTP 404");
     }
 
     #[test]
