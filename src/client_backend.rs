@@ -3017,6 +3017,10 @@ fn watching_progress_filter_matches(
 ) -> bool {
     !filter.only_available_unwatched() || has_unwatched_episodes(item)
 }
+fn watching_filter_requires_availability_cache(filter: &WatchingAnimeFilter) -> bool {
+    filter.only_available_unwatched() || filter.check_subtitle_availability_online()
+}
+
 
 fn watching_cache_filter_matches(
     item: &WatchingListApiItem,
@@ -3027,7 +3031,7 @@ fn watching_cache_filter_matches(
         return false;
     }
 
-    if !filter.only_available_unwatched() {
+    if !watching_filter_requires_availability_cache(filter) {
         return true;
     }
 
@@ -4781,6 +4785,18 @@ mod tests {
         assert!(!watching_cache_filter_matches(&item, &filter, &cache));
     }
 
+    #[test]
+    fn cache_filter_honors_subtitle_filter_without_unwatched_toggle() {
+        let item = watching_item(Some("2"), Some(3));
+        let filter = WatchingAnimeFilter {
+            check_subtitle_availability_online: Some(true),
+            subtitle_language: Some("PL".to_string()),
+            ..Default::default()
+        };
+
+
+        assert!(!watching_cache_filter_matches(&item, &filter, &WatchingAvailabilityCache::default()));
+    }
     #[test]
     fn cache_filter_uses_cached_subtitle_language_availability() {
         let item = watching_item(Some("2"), Some(3));
