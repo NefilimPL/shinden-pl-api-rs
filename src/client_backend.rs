@@ -13,6 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::sleep;
 
 const WATCHING_LIST_PAGE_LIMIT: usize = 100;
 const WATCHING_LIST_STATUSES: [&str; 6] = [
@@ -23,11 +24,12 @@ const WATCHING_LIST_STATUSES: [&str; 6] = [
     "dropped",
     "plan",
 ];
-const WATCHING_CACHE_TTL_MS: u64 = 30 * 60 * 1000;
-const WATCHING_CACHE_REFRESH_CONCURRENCY: usize = 4;
+const WATCHING_CACHE_TTL_MS: u64 = 2 * 60 * 60 * 1000;
+const WATCHING_CACHE_REFRESH_CONCURRENCY: usize = 1;
 const WATCHING_CACHE_REQUEST_RETRIES: usize = 2;
 const WATCHING_CACHE_RETRY_DELAY_MS: u64 = 750;
-const USER_ANIME_LIST_DETAIL_REFRESH_CONCURRENCY: usize = 4;
+const BACKGROUND_REQUEST_SPACING_MS: u64 = 900;
+const USER_ANIME_LIST_DETAIL_REFRESH_CONCURRENCY: usize = 1;
 const USER_ID_CACHE_TTL_MS: u64 = 60 * 60 * 1000;
 const SHINDEN_TITLE_PLACEHOLDER: &str =
     "https://shinden.pl/res/other/placeholders/title/100x100.jpg";
@@ -173,6 +175,8 @@ impl WatchingAnimeFilter {
 #[serde(rename_all = "camelCase")]
 struct WatchingAvailabilityCache {
     entries: HashMap<String, WatchingAvailabilityCacheEntry>,
+    #[serde(default)]
+    canonical_title_urls: HashMap<u64, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -580,20 +584,27 @@ impl ShindenClientBackend {
     ) -> Result<Vec<WatchingAnime>, String> {
         let filter = filter.unwrap_or_default();
         let cache = load_watching_availability_cache();
+        if !watching_filter_requires_availability_cache(&filter) {
+            let cached_anime = cached_watching_anime(&load_user_anime_list_cache());
+            if !cached_anime.is_empty() {
+                return Ok(cached_anime);
+            }
+        }
+
         let items = fetch_all_watching_items(&self.api, &self.user_id_cache).await?;
-        let canonical_urls = cached_canonical_title_urls(&load_user_anime_list_cache());
+        let mut canonical_urls = cached_canonical_title_urls(&load_user_anime_list_cache());
+        canonical_urls.extend(
+            cache.canonical_title_urls.iter()
+                .filter(|(title_id, url)| is_canonical_title_url(url, **title_id))
+                .map(|(title_id, url)| (*title_id, url.clone())),
+        );
         let mut anime = Vec::new();
 
         for item in items
             .into_iter()
             .filter(|item| watching_cache_filter_matches(item, &filter, &cache))
         {
-            let url = match canonical_urls.get(&item.title_id) {
-                Some(url) => url.clone(),
-                None => resolve_canonical_title_url(&self.api, &item)
-                    .await
-                    .unwrap_or_else(|_| series_url(item.title_id)),
-            };
+            let url = canonical_url_from_cache_or_fallback(item.title_id, &canonical_urls);
 
             if let Some(item) = map_watching_list_item_details_with_url(item, url) {
                 anime.push(item);
@@ -611,12 +622,19 @@ impl ShindenClientBackend {
         let mut cache = load_user_anime_list_cache();
         let now_ms = unix_timestamp_ms_u64();
 
+        if should_return_cached_user_anime_lists(&cache, force_refresh) {
+            let active_items = active_user_anime_list_items(&cache);
+            return Ok(user_anime_lists_payload(
+                active_items,
+                cache.refreshed_at_ms,
+                None,
+            ));
+        }
+
         match fetch_all_userlist_items(&self.api, &self.user_id_cache).await {
             Ok(items) => {
                 let existing_keys = user_anime_list_cache_keys(&cache);
-                let canonical_urls = resolve_canonical_title_urls(&self.api, &items).await;
                 merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
-                apply_canonical_title_urls(&mut cache, &canonical_urls);
                 let new_keys = new_active_user_anime_list_cache_keys(&cache, &existing_keys);
                 let sync_error = refresh_new_user_anime_detail_metadata(
                     &self.api,
@@ -730,10 +748,21 @@ impl ShindenClientBackend {
         url: String,
         title_id: Option<u64>,
         total_episodes: Option<u32>,
+        title_name: Option<String>,
     ) -> Result<Vec<EpisodeProgress>, String> {
+        let playback_url = match (
+            title_id.or_else(|| title_id_from_series_url(&url).and_then(|value| value.parse::<u64>().ok())),
+            title_name.as_deref(),
+        ) {
+            (Some(resolved_title_id), Some(title_name)) => {
+                resolve_playback_title_url(&self.api, resolved_title_id, title_name, &url).await?
+            }
+            _ => url.clone(),
+        };
+
         let playback_episodes = self
             .api
-            .get_episodes(&url)
+            .get_episodes(&playback_url)
             .await
             .map_err(|e| command_error("get_episodes_with_progress playback", e))?;
 
@@ -1917,6 +1946,7 @@ async fn get_watching_cache_episodes(
     let mut last_error = String::new();
 
     for attempt in 0..=WATCHING_CACHE_REQUEST_RETRIES {
+        wait_before_background_request().await;
         match api.get_episodes(series_url).await {
             Ok(episodes) => return Ok(episodes),
             Err(error) => {
@@ -1937,6 +1967,7 @@ async fn get_watching_cache_players(
     let mut last_error = String::new();
 
     for attempt in 0..=WATCHING_CACHE_REQUEST_RETRIES {
+        wait_before_background_request().await;
         match api.get_players(episode_url).await {
             Ok(players) => return Ok(players),
             Err(error) => {
@@ -1954,6 +1985,10 @@ fn wait_before_watching_cache_retry(attempt: usize) {
     if attempt < WATCHING_CACHE_REQUEST_RETRIES {
         std::thread::sleep(Duration::from_millis(WATCHING_CACHE_RETRY_DELAY_MS));
     }
+}
+
+async fn wait_before_background_request() {
+    sleep(Duration::from_millis(BACKGROUND_REQUEST_SPACING_MS)).await;
 }
 
 fn log_watching_cache_retry(context: &str, url: &str, attempt: usize, error: &str) {
@@ -2053,6 +2088,7 @@ async fn resolve_canonical_title_url(
     api: &ShindenAPI,
     item: &WatchingListApiItem,
 ) -> Result<String, String> {
+    wait_before_background_request().await;
     let results = api
         .search_anime(&item.title)
         .await
@@ -2064,6 +2100,44 @@ async fn resolve_canonical_title_url(
             format!("No search result matched title ID {}", item.title_id),
         )
     })
+}
+
+async fn resolve_playback_title_url(
+    api: &ShindenAPI,
+    title_id: u64,
+    title_name: &str,
+    fallback_url: &str,
+) -> Result<String, String> {
+    if is_canonical_title_url(fallback_url, title_id) {
+        return Ok(fallback_url.to_string());
+    }
+
+    let mut cache = load_watching_availability_cache();
+    if let Some(url) = cache.canonical_title_urls.get(&title_id) {
+        if is_canonical_title_url(url, title_id) {
+            return Ok(url.clone());
+        }
+    }
+
+    if let Some(url) = cached_canonical_title_urls(&load_user_anime_list_cache()).get(&title_id) {
+        return Ok(url.clone());
+    }
+
+    wait_before_background_request().await;
+    let results = api
+        .search_anime(title_name)
+        .await
+        .map_err(|error| command_error("resolve_playback_title_url search", error))?;
+    let url = canonical_title_url_from_search_results(title_id, &results).ok_or_else(|| {
+        command_error(
+            "resolve_playback_title_url result",
+            format!("No search result matched title ID {title_id}"),
+        )
+    })?;
+
+    cache.canonical_title_urls.insert(title_id, url.clone());
+    save_watching_availability_cache(&cache)?;
+    Ok(url)
 }
 
 async fn resolve_canonical_title_urls(
@@ -2106,6 +2180,14 @@ fn cached_canonical_title_urls(cache: &UserAnimeListCache) -> HashMap<u64, Strin
         .map(|item| (item.title_id, item.url.clone()))
         .collect()
 }
+
+fn canonical_url_from_cache_or_fallback(title_id: u64, urls: &HashMap<u64, String>) -> String {
+    urls
+        .get(&title_id)
+        .cloned()
+        .unwrap_or_else(|| series_url(title_id))
+}
+
 
 fn title_id_from_series_url(url: &str) -> Option<String> {
     ["/series/", "/titles/"]
@@ -2636,6 +2718,27 @@ fn map_watching_list_item_details(item: WatchingListApiItem) -> Option<WatchingA
     map_watching_list_item_details_with_url(item, url)
 }
 
+fn cached_watching_anime(cache: &UserAnimeListCache) -> Vec<WatchingAnime> {
+    active_user_anime_list_items(cache)
+        .into_iter()
+        .filter(|item| item.watch_status == "in progress")
+        .map(|item| WatchingAnime {
+            title_id: item.title_id,
+            name: item.name,
+            url: item.url,
+            image_url: item.image_url,
+            anime_type: item.anime_type,
+            rating: item.rating,
+            episodes: item.episodes,
+            description: item.description,
+            watch_status: item.watch_status,
+            is_favourite: item.is_favourite,
+            watched_episodes_count: item.watched_episodes_count,
+            total_episodes: item.total_episodes,
+        })
+        .collect()
+}
+
 fn map_watching_list_item_details_with_url(
     item: WatchingListApiItem,
     url: String,
@@ -2711,10 +2814,8 @@ async fn refresh_user_anime_list_cache_inner(
     let mut cache = load_user_anime_list_cache();
     let now_ms = unix_timestamp_ms_u64();
     let items = fetch_all_userlist_items(api, user_id_cache).await?;
-    let canonical_urls = resolve_canonical_title_urls(api, &items).await;
 
     merge_user_anime_list_cache(&mut cache, items, true, now_ms);
-    apply_canonical_title_urls(&mut cache, &canonical_urls);
     cache.refreshed_at_ms = Some(now_ms);
     save_user_anime_list_cache(&cache)?;
 
@@ -2747,6 +2848,7 @@ async fn process_user_anime_list_refresh_queue(
         let title = state.queue[index].title.clone();
         let url = state.queue[index].url.clone();
 
+        wait_before_background_request().await;
         match api.get_anime_details(&url).await {
             Ok(details) => {
                 if let Some(item) = cache.items.get_mut(&key) {
@@ -2886,7 +2988,10 @@ async fn refresh_new_user_anime_detail_metadata(
 
     let mut errors = 0usize;
     let mut detail_results = stream::iter(targets)
-        .map(|(key, url)| async move { (key, api.get_anime_details(&url).await) })
+        .map(|(key, url)| async move {
+            wait_before_background_request().await;
+            (key, api.get_anime_details(&url).await)
+        })
         .buffer_unordered(USER_ANIME_LIST_DETAIL_REFRESH_CONCURRENCY);
 
     while let Some((key, result)) = detail_results.next().await {
@@ -3008,6 +3113,10 @@ fn active_user_anime_list_items(cache: &UserAnimeListCache) -> Vec<UserAnimeList
         .collect();
     items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     items
+}
+
+fn should_return_cached_user_anime_lists(cache: &UserAnimeListCache, force_refresh: bool) -> bool {
+    !force_refresh && cache.items.values().any(|item| item.active)
 }
 
 
@@ -4636,6 +4745,34 @@ mod tests {
             Some("https://shinden.pl/series/68581-bye-bye-earth-2nd-season"),
         );
     }
+    #[test]
+    fn cached_canonical_url_is_used_without_a_new_title_search() {
+        let urls = HashMap::from([(
+            68581,
+            "https://shinden.pl/series/68581-bye-bye-earth-2nd-season".to_string(),
+        )]);
+
+        assert_eq!(
+            canonical_url_from_cache_or_fallback(68581, &urls),
+            "https://shinden.pl/series/68581-bye-bye-earth-2nd-season",
+        );
+        assert_eq!(
+            canonical_url_from_cache_or_fallback(69862, &urls),
+            "https://shinden.pl/series/69862",
+        );
+    }
+
+    #[test]
+    fn cached_user_list_is_returned_without_live_refresh_unless_forced() {
+        let item = cached_user_anime_fixture(68581, "Bye Bye, Earth 2nd Season", "in progress", true);
+        let mut cache = UserAnimeListCache::default();
+        cache.items.insert(user_anime_list_cache_key(item.title_id), item);
+
+        assert!(should_return_cached_user_anime_lists(&cache, false));
+        assert!(!should_return_cached_user_anime_lists(&cache, true));
+        assert!(!should_return_cached_user_anime_lists(&UserAnimeListCache::default(), false));
+    }
+
 
     #[test]
     fn title_id_from_series_url_extracts_numeric_id() {
@@ -4843,8 +4980,8 @@ mod tests {
     }
 
     #[test]
-    fn watching_cache_refresh_scans_four_titles_concurrently() {
-        assert_eq!(WATCHING_CACHE_REFRESH_CONCURRENCY, 4);
+    fn watching_cache_refresh_scans_titles_serially_to_avoid_rate_limits() {
+        assert_eq!(WATCHING_CACHE_REFRESH_CONCURRENCY, 1);
     }
 
     #[test]
