@@ -183,7 +183,16 @@ struct WatchingAvailabilityCacheEntry {
     total_episodes: Option<u32>,
     has_available_unwatched_episode: bool,
     subtitle_availability: HashMap<String, bool>,
+    #[serde(default)]
+    episode_availability: HashMap<String, WatchingEpisodeAvailability>,
     checked_at_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchingEpisodeAvailability {
+    pub has_players: bool,
+    pub subtitle_availability: HashMap<String, bool>,
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
@@ -919,6 +928,17 @@ impl ShindenClientBackend {
 
     pub fn get_watching_cache_refresh_status(&self) -> Result<WatchingCacheRefreshStatus, String> {
         refresh_status_snapshot(&self.refresh_status)
+    }
+
+    pub fn get_watching_episode_availability(
+        &self,
+        title_id: u64,
+    ) -> Option<HashMap<String, WatchingEpisodeAvailability>> {
+        load_watching_availability_cache()
+            .entries
+            .get(&watching_cache_key(title_id))
+            .filter(|entry| entry.title_id == title_id)
+            .map(|entry| entry.episode_availability.clone())
     }
 
     pub async fn refresh_watching_anime_cache(
@@ -1790,7 +1810,7 @@ fn collect_watching_cache_refresh_plan(
 async fn scan_watching_item_availability(
     api: &ShindenAPI,
     item: &WatchingListApiItem,
-    subtitle_key: Option<&str>,
+    _subtitle_key: Option<&str>,
     subtitle_cache_key: Option<&str>,
     _exclude_ai_subtitles: bool,
 ) -> Result<WatchingAvailabilityCacheEntry, String> {
@@ -1799,18 +1819,33 @@ async fn scan_watching_item_availability(
     let watched_count = watched_episode_count(item) as usize;
     let mut has_available_unwatched_episode = false;
     let mut subtitle_availability = HashMap::new();
+    let mut episode_availability = HashMap::new();
 
-    for episode in episodes.into_iter().skip(watched_count) {
+    for (episode_index, episode) in episodes.into_iter().enumerate() {
         let players = get_watching_cache_players(api, &episode.link).await?;
+        let availability = watching_episode_availability(&players);
 
-        if record_watching_cache_episode_availability(
-            &players,
-            subtitle_key,
-            &mut subtitle_availability,
-        ) {
-            has_available_unwatched_episode = true;
-            break;
+        if episode_index >= watched_count {
+            let matches_filter = availability.has_players
+                && subtitle_cache_key
+                    .map(|cache_key| {
+                        availability
+                            .subtitle_availability
+                            .get(cache_key)
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(true);
+            has_available_unwatched_episode |= matches_filter;
+
+            for (cache_key, is_available) in &availability.subtitle_availability {
+                if *is_available {
+                    subtitle_availability.insert(cache_key.clone(), true);
+                }
+            }
         }
+
+        episode_availability.insert(episode.link, availability);
     }
 
     if let Some(cache_key) = subtitle_cache_key {
@@ -1825,8 +1860,22 @@ async fn scan_watching_item_availability(
         total_episodes: item.episodes,
         has_available_unwatched_episode,
         subtitle_availability,
+        episode_availability,
         checked_at_ms: unix_timestamp_ms_u64(),
     })
+}
+
+fn watching_episode_availability(players: &[Player]) -> WatchingEpisodeAvailability {
+    let mut subtitle_availability = HashMap::new();
+
+    for player in players {
+        record_subtitle_language_availability(&mut subtitle_availability, &player.lang_subs);
+    }
+
+    WatchingEpisodeAvailability {
+        has_players: !players.is_empty(),
+        subtitle_availability,
+    }
 }
 
 fn record_watching_cache_episode_availability(
@@ -3192,6 +3241,10 @@ fn cache_entry_satisfies_refresh(
     force: bool,
 ) -> bool {
     if force || !cache_entry_matches_item(entry, item) {
+        return false;
+    }
+
+    if entry.episode_availability.is_empty() {
         return false;
     }
 
@@ -4766,6 +4819,30 @@ mod tests {
     }
 
     #[test]
+    fn episode_availability_keeps_player_and_subtitle_state_per_episode() {
+        let availability = watching_episode_availability(&[
+            Player {
+                player: "default".to_string(),
+                max_res: "1080p".to_string(),
+                lang_audio: "JP".to_string(),
+                lang_subs: "IPL".to_string(),
+                online_id: "one".to_string(),
+            },
+            Player {
+                player: "default".to_string(),
+                max_res: "1080p".to_string(),
+                lang_audio: "JP".to_string(),
+                lang_subs: "PL".to_string(),
+                online_id: "two".to_string(),
+            },
+        ]);
+
+        assert!(availability.has_players);
+        assert_eq!(availability.subtitle_availability.get("pl"), Some(&true));
+        assert_eq!(availability.subtitle_availability.get("pl:human"), Some(&true));
+    }
+
+    #[test]
     fn watching_cache_refresh_scans_four_titles_concurrently() {
         assert_eq!(WATCHING_CACHE_REFRESH_CONCURRENCY, 4);
     }
@@ -4803,6 +4880,7 @@ mod tests {
                 total_episodes: Some(3),
                 has_available_unwatched_episode: true,
                 subtitle_availability: subtitle_availability.clone(),
+                episode_availability: [("episode-3".to_string(), WatchingEpisodeAvailability::default())].into_iter().collect(),
                 checked_at_ms: 10_000,
             },
         );
@@ -4814,6 +4892,7 @@ mod tests {
                 total_episodes: Some(3),
                 has_available_unwatched_episode: true,
                 subtitle_availability,
+                episode_availability: Default::default(),
                 checked_at_ms: 0,
             },
         );
@@ -4940,6 +5019,7 @@ mod tests {
                 total_episodes: Some(3),
                 has_available_unwatched_episode: false,
                 subtitle_availability: Default::default(),
+                episode_availability: Default::default(),
                 checked_at_ms: 1000,
             },
         );
@@ -4979,6 +5059,7 @@ mod tests {
                 total_episodes: Some(3),
                 has_available_unwatched_episode: true,
                 subtitle_availability,
+                episode_availability: Default::default(),
                 checked_at_ms: 1000,
             },
         );
@@ -5019,6 +5100,7 @@ mod tests {
                 total_episodes: Some(4),
                 has_available_unwatched_episode: true,
                 subtitle_availability,
+                episode_availability: Default::default(),
                 checked_at_ms: 1000,
             },
         );
@@ -5044,6 +5126,7 @@ mod tests {
                 total_episodes: Some(4),
                 has_available_unwatched_episode: true,
                 subtitle_availability,
+                episode_availability: Default::default(),
                 checked_at_ms: 10_000,
             },
         );
@@ -5082,6 +5165,7 @@ mod tests {
                 total_episodes: Some(3),
                 has_available_unwatched_episode: true,
                 subtitle_availability,
+                episode_availability: Default::default(),
                 checked_at_ms: 1000,
             },
         );
@@ -5109,6 +5193,7 @@ mod tests {
             total_episodes: Some(3),
             has_available_unwatched_episode: true,
             subtitle_availability,
+            episode_availability: [("episode-3".to_string(), WatchingEpisodeAvailability::default())].into_iter().collect(),
             checked_at_ms: 10_000,
         };
 
@@ -5132,6 +5217,30 @@ mod tests {
             Some("pl"),
             10_500,
             true
+        ));
+    }
+
+    #[test]
+    fn cache_without_episode_snapshots_is_refreshed_even_when_fresh() {
+        let item = watching_item(Some("2"), Some(3));
+        let mut subtitle_availability = std::collections::HashMap::new();
+        subtitle_availability.insert("pl".to_string(), true);
+        let entry = WatchingAvailabilityCacheEntry {
+            title_id: 59922,
+            watched_episodes_cnt: 2,
+            total_episodes: Some(3),
+            has_available_unwatched_episode: true,
+            subtitle_availability,
+            episode_availability: Default::default(),
+            checked_at_ms: 10_000,
+        };
+
+        assert!(!cache_entry_satisfies_refresh(
+            &entry,
+            &item,
+            Some("pl"),
+            10_500,
+            false
         ));
     }
 
