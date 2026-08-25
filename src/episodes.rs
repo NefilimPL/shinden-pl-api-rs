@@ -5,7 +5,12 @@ use scraper::{Html, Selector};
 
 impl ShindenAPI {
     pub async fn get_episodes(&self, link: &str) -> Result<Vec<Episode>> {
-        let url = format!("{}/all-episodes", link);
+        let series_url = if requires_series_url_resolution(link) {
+            self.resolve_final_url(link).await?
+        } else {
+            link.trim().to_string()
+        };
+        let url = episode_page_url(&series_url);
 
         let html = self.get_html(&url).await?;
         let doc = Html::parse_document(&html);
@@ -37,5 +42,45 @@ impl ShindenAPI {
 
         episodes.reverse();
         Ok(episodes)
+    }
+}
+
+fn episode_page_url(series_url: &str) -> String {
+    let without_fragment = series_url.split('#').next().unwrap_or(series_url);
+    let base = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment)
+        .trim_end_matches('/');
+    format!("{base}/episodes")
+}
+
+fn requires_series_url_resolution(link: &str) -> bool {
+    let path = link
+        .split_once("/series/")
+        .or_else(|| link.split_once("/titles/"));
+    let Some((_, path)) = path else {
+        return false;
+    };
+    let segment = path.split('/').next().unwrap_or_default().split('?').next().unwrap_or_default();
+    !segment.is_empty() && segment.chars().all(|character| character.is_ascii_digit())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_current_episode_page_url_from_canonical_series_url() {
+        assert_eq!(
+            episode_page_url("https://shinden.pl/series/71632-kokoore/"),
+            "https://shinden.pl/series/71632-kokoore/episodes"
+        );
+    }
+
+    #[test]
+    fn resolves_slugless_series_urls_before_loading_episodes() {
+        assert!(requires_series_url_resolution("https://shinden.pl/series/71632"));
+        assert!(requires_series_url_resolution("https://shinden.pl/titles/68581"));
+        assert!(!requires_series_url_resolution("https://shinden.pl/series/71632-kokoore"));
     }
 }
