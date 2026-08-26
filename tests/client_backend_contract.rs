@@ -3,6 +3,7 @@ use shinden_pl_api::client_backend::{
     UserAnimeListRefreshStatus, UserAnimeListRefreshSummary, UserAnimeListsPayload, WatchingAnime,
     WatchingAnimeFilter,
 };
+use shinden_pl_api::models::{SearchFilterRequest, SearchTagSelection};
 
 #[test]
 fn backend_can_be_constructed_without_network_access() {
@@ -155,4 +156,22 @@ fn frontend_contract_types_keep_expected_json_shape() {
     assert_eq!(refresh_json["status"]["total"], 5);
     assert_eq!(refresh_json["status"]["remaining"], 3);
     assert_eq!(refresh_json["status"]["currentTitle"], "Season show");
+}
+
+#[test]
+fn filtered_search_request_keeps_only_public_tag_selection_data() {
+    let request = SearchFilterRequest {
+        query: "Cowboy Bebop".to_string(),
+        tags: vec![SearchTagSelection::include(5), SearchTagSelection::exclude(39)],
+        genres_type: "all".to_string(),
+    };
+
+    let json = serde_json::to_value(request).expect("filtered search request serializes");
+
+    assert_eq!(json["query"], "Cowboy Bebop");
+    assert_eq!(json["genresType"], "all");
+    assert_eq!(json["tags"][0]["tagId"], 5);
+    assert_eq!(json["tags"][0]["mode"], "include");
+    assert_eq!(json["tags"][1]["mode"], "exclude");
+    assert!(json["tags"][0].get("formName").is_none());
 }

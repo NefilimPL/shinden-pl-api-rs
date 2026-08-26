@@ -3,7 +3,7 @@ use crate::details::{
     AnimeDetails, AnimeRatingUpdate, anime_rating_url, basic_auth_token, normalize_rating_type,
     rating_update_form,
 };
-use crate::models::{Anime, Episode, Player};
+use crate::models::{Anime, Episode, Player, SearchFilterCatalog, SearchFilterRequest};
 use futures_util::stream::{self, StreamExt};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, ORIGIN, REFERER};
 use serde::{Deserialize, Serialize};
@@ -494,6 +494,30 @@ impl ShindenClientBackend {
             .search_anime(&query)
             .await
             .map_err(|e| command_error("search", e))?;
+
+        let watching_items = fetch_all_userlist_items(&self.api, &self.user_id_cache)
+            .await
+            .unwrap_or_default();
+
+        Ok(map_search_anime_results(results, watching_items))
+    }
+
+    pub async fn get_search_filter_catalog(&self) -> Result<SearchFilterCatalog, String> {
+        self.api
+            .get_search_filter_catalog()
+            .await
+            .map_err(|error| command_error("get_search_filter_catalog", error))
+    }
+
+    pub async fn search_with_filters(
+        &self,
+        request: SearchFilterRequest,
+    ) -> Result<Vec<SearchAnime>, String> {
+        let results = self
+            .api
+            .search_anime_with_filters(&request)
+            .await
+            .map_err(|error| command_error("search_with_filters", error))?;
 
         let watching_items = fetch_all_userlist_items(&self.api, &self.user_id_cache)
             .await

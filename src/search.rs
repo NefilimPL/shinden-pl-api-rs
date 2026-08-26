@@ -1,16 +1,64 @@
-use crate::{client::ShindenAPI, models::Anime};
+use crate::{
+    client::ShindenAPI,
+    models::{
+        Anime, SearchFilterCatalog, SearchFilterRequest, SearchTagGroup, SearchTagOption,
+        SearchTagSelection, SearchTagSelectionMode,
+    },
+};
 use anyhow::Result;
+use reqwest::Url;
 use scraper::{Html, Selector};
 
 impl ShindenAPI {
     pub async fn search_anime(&self, name: &str) -> Result<Vec<Anime>> {
-        let search_url = format!(
-            "https://shinden.pl/series?search={}",
-            name.replace(' ', "+")
-        );
-        let html = self.get_html(&search_url).await?;
+        self.search_anime_with_filters(&SearchFilterRequest {
+            query: name.to_string(),
+            ..Default::default()
+        }).await
+    }
 
-        let doc = Html::parse_document(&html);
+    pub async fn get_search_filter_catalog(&self) -> Result<SearchFilterCatalog> {
+        let html = self.get_html("https://shinden.pl/series?").await?;
+        Ok(parse_search_filter_catalog_html(&html))
+    }
+
+    pub async fn search_anime_with_filters(&self, request: &SearchFilterRequest) -> Result<Vec<Anime>> {
+        if !request.tags.is_empty() {
+            let catalog = self.get_search_filter_catalog().await?;
+            let available_tags = catalog
+                .groups
+                .iter()
+                .flat_map(|group| group.options.iter().map(|option| option.id))
+                .collect::<std::collections::HashSet<_>>();
+            if request
+                .tags
+                .iter()
+                .any(|tag| !available_tags.contains(&tag.tag_id))
+            {
+                anyhow::bail!("Search request contains a tag that is not available in Shinden filters");
+            }
+        }
+
+        let mut search_url = Url::parse("https://shinden.pl/series")?;
+        {
+            let mut query = search_url.query_pairs_mut();
+            query.append_pair("type", "contains");
+            query.append_pair("search", request.query.trim());
+            if !request.tags.is_empty() {
+                query.append_pair("genres-type", search_genres_type(&request.genres_type));
+                query.append_pair("genres", &encode_search_genres(&request.tags));
+            }
+        }
+        let html = self.get_html(search_url.as_str()).await?;
+
+        Ok(parse_search_results_html(&html))
+    }
+
+}
+
+fn parse_search_results_html(html: &str) -> Vec<Anime> {
+
+        let doc = Html::parse_document(html);
         let div_row = Selector::parse(".div-row").unwrap();
         let h3 = Selector::parse("h3").unwrap();
         let a = Selector::parse("a").unwrap();
@@ -69,7 +117,83 @@ impl ShindenAPI {
             }
         }
 
-        Ok(result)
+        result
+}
+
+fn parse_search_filter_catalog_html(html: &str) -> SearchFilterCatalog {
+    let doc = Html::parse_document(html);
+    let tabs = Selector::parse(".search-items-tabs a[id]").expect("valid tab selector");
+    let options = Selector::parse("a.genre-item[data-id]").expect("valid tag option selector");
+
+    let groups = doc.select(&tabs).filter_map(|tab| {
+        let tab_id = tab.value().attr("id")?;
+        let group_id = tab_id.strip_prefix("goTab")?.to_ascii_lowercase();
+        let group_selector = Selector::parse(&format!("#Tab{}", &tab_id[5..])).ok()?;
+        let group = doc.select(&group_selector).next()?;
+        let options = group.select(&options).filter_map(|option| {
+            let id = option.value().attr("data-id")?.parse::<u64>().ok()?;
+            let label = option.text().collect::<String>().trim().to_string();
+            (!label.is_empty()).then_some(SearchTagOption { id, label })
+        }).collect::<Vec<_>>();
+
+        (!options.is_empty()).then_some(SearchTagGroup {
+            id: group_id,
+            label: tab.text().collect::<String>().trim().to_string(),
+            options,
+        })
+    }).collect();
+
+    SearchFilterCatalog { groups }
+}
+
+fn encode_search_genres(tags: &[SearchTagSelection]) -> String {
+    tags.iter().map(|tag| {
+        let mode = match tag.mode {
+            SearchTagSelectionMode::Include => 'i',
+            SearchTagSelectionMode::Exclude => 'e',
+        };
+        format!("{mode}{}", tag.tag_id)
+    }).collect::<Vec<_>>().join(";")
+}
+
+fn search_genres_type(value: &str) -> &str {
+    if value == "one" { "one" } else { "all" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_included_and_excluded_tags_for_shinden() {
+        let genres = encode_search_genres(&[
+            SearchTagSelection::include(5),
+            SearchTagSelection::include(1741),
+            SearchTagSelection::include(92),
+            SearchTagSelection::exclude(39),
+        ]);
+
+        assert_eq!(genres, "i5;i1741;i92;e39");
+    }
+
+    #[test]
+    fn parses_tag_groups_from_the_series_search_form() {
+        let html = r#"
+            <form method="GET" action="/series" class="search-form">
+                <ul class="tabs search-items-tabs"><li><a id="goTabGenres">Gatunki</a></li><li><a id="goTabtarget_group">Grupy docelowe</a></li></ul>
+                <div id="TabGenres"><ul class="genre-list"><li><a class="genre-item" data-id="5">Akcja</a></li></ul></div>
+                <div id="Tabtarget_group"><ul class="genre-list"><li><a class="genre-item" data-id="39">Josei</a></li></ul></div>
+            </form>
+        "#;
+
+        let catalog = parse_search_filter_catalog_html(html);
+
+        assert_eq!(catalog.groups.len(), 2);
+        assert_eq!(catalog.groups[0].id, "genres");
+        assert_eq!(catalog.groups[0].label, "Gatunki");
+        assert_eq!(catalog.groups[0].options[0].id, 5);
+        assert_eq!(catalog.groups[1].id, "target_group");
+        assert_eq!(catalog.groups[1].options[0].label, "Josei");
     }
 }
 
