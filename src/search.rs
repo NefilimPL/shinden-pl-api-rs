@@ -39,6 +39,13 @@ impl ShindenAPI {
             }
         }
 
+        if let Some(letter) = request.letter.as_deref() {
+            let catalog = self.get_search_filter_catalog().await?;
+            if !catalog.letters.iter().any(|available| available == letter) {
+                anyhow::bail!("Search request contains a letter that is not available in Shinden filters");
+            }
+        }
+
         let mut search_url = Url::parse("https://shinden.pl/series")?;
         {
             let mut query = search_url.query_pairs_mut();
@@ -47,6 +54,10 @@ impl ShindenAPI {
             if !request.tags.is_empty() {
                 query.append_pair("genres-type", search_genres_type(&request.genres_type));
                 query.append_pair("genres", &encode_search_genres(&request.tags));
+            }
+            if let Some(letter) = request.letter.as_deref() {
+                query.append_pair("letter", letter);
+                query.append_pair("page", "1");
             }
         }
         let html = self.get_html(search_url.as_str()).await?;
@@ -124,6 +135,7 @@ fn parse_search_filter_catalog_html(html: &str) -> SearchFilterCatalog {
     let doc = Html::parse_document(html);
     let tabs = Selector::parse(".search-items-tabs a[id]").expect("valid tab selector");
     let options = Selector::parse("a.genre-item[data-id]").expect("valid tag option selector");
+    let letters = Selector::parse("#TabLetters a[href*='letter=']").expect("valid letter selector");
 
     let groups = doc.select(&tabs).filter_map(|tab| {
         let tab_id = tab.value().attr("id")?;
@@ -143,7 +155,18 @@ fn parse_search_filter_catalog_html(html: &str) -> SearchFilterCatalog {
         })
     }).collect();
 
-    SearchFilterCatalog { groups }
+    let letters = doc
+        .select(&letters)
+        .filter_map(|letter| {
+            let href = letter.value().attr("href")?;
+            let value = Url::parse("https://shinden.pl/").ok()?.join(href).ok()?
+                .query_pairs()
+                .find_map(|(key, value)| (key == "letter").then_some(value.into_owned()))?;
+            (!value.is_empty()).then_some(value)
+        })
+        .collect();
+
+    SearchFilterCatalog { groups, letters }
 }
 
 fn encode_search_genres(tags: &[SearchTagSelection]) -> String {
@@ -181,6 +204,7 @@ mod tests {
         let html = r#"
             <form method="GET" action="/series" class="search-form">
                 <ul class="tabs search-items-tabs"><li><a id="goTabGenres">Gatunki</a></li><li><a id="goTabtarget_group">Grupy docelowe</a></li></ul>
+                <ul id="TabLetters"><li><a href="?letter=A&amp;page=1">A</a></li><li><a href="?letter=1&amp;page=1">#</a></li></ul>
                 <div id="TabGenres"><ul class="genre-list"><li><a class="genre-item" data-id="5">Akcja</a></li></ul></div>
                 <div id="Tabtarget_group"><ul class="genre-list"><li><a class="genre-item" data-id="39">Josei</a></li></ul></div>
             </form>
@@ -194,6 +218,7 @@ mod tests {
         assert_eq!(catalog.groups[0].options[0].id, 5);
         assert_eq!(catalog.groups[1].id, "target_group");
         assert_eq!(catalog.groups[1].options[0].label, "Josei");
+        assert_eq!(catalog.letters, vec!["A", "1"]);
     }
 }
 

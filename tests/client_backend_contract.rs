@@ -164,6 +164,7 @@ fn filtered_search_request_keeps_only_public_tag_selection_data() {
         query: "Cowboy Bebop".to_string(),
         tags: vec![SearchTagSelection::include(5), SearchTagSelection::exclude(39)],
         genres_type: "all".to_string(),
+        letter: None,
     };
 
     let json = serde_json::to_value(request).expect("filtered search request serializes");

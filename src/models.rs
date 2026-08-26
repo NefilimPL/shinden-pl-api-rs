@@ -14,6 +14,7 @@ pub struct Anime {
 #[serde(rename_all = "camelCase")]
 pub struct SearchFilterCatalog {
     pub groups: Vec<SearchTagGroup>,
+    pub letters: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -63,6 +64,8 @@ pub struct SearchFilterRequest {
     pub tags: Vec<SearchTagSelection>,
     #[serde(default = "default_search_genres_type")]
     pub genres_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub letter: Option<String>,
 }
 
 fn default_search_genres_type() -> String {
