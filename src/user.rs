@@ -2,7 +2,6 @@ use crate::client::ShindenAPI;
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue};
 use scraper::{Html, Selector};
-use crate::headers::get_headers_for_type;
 
 impl ShindenAPI {
     pub async fn login(&self, email: &str, password: &str) -> Result<()> {

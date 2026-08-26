@@ -58,6 +58,7 @@ struct TitleEpisodesApiResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Fields retained to deserialize the complete API response.
 struct TitleEpisodesApiResult {
     count: u32,
     items: Vec<TitleEpisodeApiItem>,
@@ -65,6 +66,7 @@ struct TitleEpisodesApiResult {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Fields retained to deserialize the complete API response.
 struct TitleEpisodeApiItem {
     episode_id: u64,
     episode_no: u32,
@@ -80,6 +82,7 @@ struct TitleEpisodeApiItem {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Fields retained to deserialize the complete API response.
 struct TitleEpisodeWatchedApiItem {
     episode_id: u64,
     view_cnt: u32,
@@ -88,6 +91,7 @@ struct TitleEpisodeWatchedApiItem {
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // Fields retained to deserialize the complete API response.
 struct TitleEpisodeTitleApiItem {
     lang: String,
     episode_id: u64,
@@ -1943,18 +1947,7 @@ fn watching_episode_availability(players: &[Player]) -> WatchingEpisodeAvailabil
     }
 }
 
-fn record_watching_cache_episode_availability(
-    players: &[Player],
-    subtitle_key: Option<&str>,
-    subtitle_availability: &mut HashMap<String, bool>,
-) -> bool {
-    record_watching_cache_episode_subtitle_availability(
-        players.iter().map(|player| player.lang_subs.as_str()),
-        subtitle_key,
-        subtitle_availability,
-    )
-}
-
+#[cfg(test)]
 fn record_watching_cache_episode_subtitle_availability<'a, I>(
     player_subtitles: I,
     subtitle_key: Option<&str>,
@@ -2176,26 +2169,6 @@ async fn resolve_playback_title_url(
     Ok(url)
 }
 
-async fn resolve_canonical_title_urls(
-    api: &ShindenAPI,
-    items: &[WatchingListApiItem],
-) -> HashMap<u64, String> {
-    let mut pending = stream::iter(items.iter().cloned().map(|item| async move {
-        let title_id = item.title_id;
-        (title_id, resolve_canonical_title_url(api, &item).await)
-    }))
-    .buffer_unordered(USER_ANIME_LIST_DETAIL_REFRESH_CONCURRENCY);
-    let mut urls = HashMap::new();
-
-    while let Some((title_id, result)) = pending.next().await {
-        if let Ok(url) = result {
-            urls.insert(title_id, url);
-        }
-    }
-
-    urls
-}
-
 fn is_canonical_title_url(url: &str, title_id: u64) -> bool {
     ["/series/", "/titles/"]
         .iter()
@@ -2223,7 +2196,6 @@ fn canonical_url_from_cache_or_fallback(title_id: u64, urls: &HashMap<u64, Strin
         .cloned()
         .unwrap_or_else(|| series_url(title_id))
 }
-
 
 fn title_id_from_series_url(url: &str) -> Option<String> {
     ["/series/", "/titles/"]
@@ -2725,6 +2697,7 @@ fn watch_status_list_slug(status: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn build_title_status_payload(
     title_id: u64,
     status: Option<&str>,
@@ -3172,16 +3145,6 @@ fn active_user_anime_list_items(cache: &UserAnimeListCache) -> Vec<UserAnimeList
 fn should_return_cached_user_anime_lists(cache: &UserAnimeListCache, force_refresh: bool) -> bool {
     !force_refresh && cache.items.values().any(|item| item.active)
 }
-
-
-fn apply_canonical_title_urls(cache: &mut UserAnimeListCache, urls: &HashMap<u64, String>) {
-    for (title_id, url) in urls {
-        if let Some(item) = cache.items.get_mut(&user_anime_list_cache_key(*title_id)) {
-            item.url = url.clone();
-        }
-    }
-}
-
 fn user_anime_list_cache_keys(cache: &UserAnimeListCache) -> HashSet<String> {
     cache.items.keys().cloned().collect()
 }
@@ -3246,6 +3209,7 @@ fn user_anime_list_cache_key(title_id: u64) -> String {
     title_id.to_string()
 }
 
+#[cfg(test)]
 fn map_watching_list_item(item: WatchingListApiItem) -> Option<Anime> {
     map_watching_list_item_details(item).map(|item| Anime {
         name: item.name,
@@ -3471,10 +3435,12 @@ fn watched_episode_count(item: &WatchingListApiItem) -> u32 {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn subtitle_language_matches(player_lang_subs: &str, selected_language: &str) -> bool {
     subtitle_language_matches_with_options(player_lang_subs, selected_language, false)
 }
 
+#[cfg(test)]
 fn subtitle_language_matches_with_options(
     player_lang_subs: &str,
     selected_language: &str,
@@ -3933,29 +3899,6 @@ fn find_project_root_from(start: &Path) -> Option<PathBuf> {
 
 fn is_project_root(path: &Path) -> bool {
     path.join("package.json").is_file() && path.join("src-tauri").join("tauri.conf.json").is_file()
-}
-
-fn install_panic_logger() {
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let payload = panic_info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| {
-                panic_info
-                    .payload()
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-            })
-            .unwrap_or("unknown panic payload");
-        let location = panic_info
-            .location()
-            .map(|location| format!("{}:{}", location.file(), location.line()))
-            .unwrap_or_else(|| "unknown location".to_string());
-        let _ = append_project_log("PANIC", &format!("{payload} at {location}"));
-        previous_hook(panic_info);
-    }));
 }
 
 #[cfg(test)]
