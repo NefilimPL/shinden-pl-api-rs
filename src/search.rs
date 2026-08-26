@@ -1,7 +1,7 @@
 use crate::{
     client::ShindenAPI,
     models::{
-        Anime, SearchFilterCatalog, SearchFilterRequest, SearchTagGroup, SearchTagOption,
+        Anime, SearchFilterCatalog, SearchFilterRequest, SearchResultsPage, SearchTagGroup, SearchTagOption,
         SearchTagSelection, SearchTagSelectionMode,
     },
 };
@@ -14,7 +14,7 @@ impl ShindenAPI {
         self.search_anime_with_filters(&SearchFilterRequest {
             query: name.to_string(),
             ..Default::default()
-        }).await
+        }).await.map(|page| page.items)
     }
 
     pub async fn get_search_filter_catalog(&self) -> Result<SearchFilterCatalog> {
@@ -22,7 +22,7 @@ impl ShindenAPI {
         Ok(parse_search_filter_catalog_html(&html))
     }
 
-    pub async fn search_anime_with_filters(&self, request: &SearchFilterRequest) -> Result<Vec<Anime>> {
+    pub async fn search_anime_with_filters(&self, request: &SearchFilterRequest) -> Result<SearchResultsPage> {
         if !request.tags.is_empty() {
             let catalog = self.get_search_filter_catalog().await?;
             let available_tags = catalog
@@ -51,20 +51,47 @@ impl ShindenAPI {
             let mut query = search_url.query_pairs_mut();
             query.append_pair("type", "contains");
             query.append_pair("search", request.query.trim());
+            query.append_pair("page", &request.page.max(1).to_string());
             if !request.tags.is_empty() {
                 query.append_pair("genres-type", search_genres_type(&request.genres_type));
                 query.append_pair("genres", &encode_search_genres(&request.tags));
             }
             if let Some(letter) = request.letter.as_deref() {
                 query.append_pair("letter", letter);
-                query.append_pair("page", "1");
             }
         }
         let html = self.get_html(search_url.as_str()).await?;
 
-        Ok(parse_search_results_html(&html))
+        Ok(parse_search_results_page_html(&html, request.page))
     }
 
+}
+
+fn parse_search_results_page_html(html: &str, requested_page: u32) -> SearchResultsPage {
+    let doc = Html::parse_document(html);
+    let page_links = Selector::parse("a[href*='page=']").expect("valid page selector");
+    let current_page = requested_page.max(1);
+    let total_pages = doc
+        .select(&page_links)
+        .filter_map(|link| page_number_from_href(link.value().attr("href")?))
+        .max()
+        .unwrap_or(current_page)
+        .max(current_page);
+
+    SearchResultsPage {
+        items: parse_search_results_html(html),
+        current_page,
+        total_pages,
+    }
+}
+
+fn page_number_from_href(href: &str) -> Option<u32> {
+    Url::parse("https://shinden.pl/")
+        .ok()?
+        .join(href)
+        .ok()?
+        .query_pairs()
+        .find_map(|(key, value)| (key == "page").then(|| value.parse().ok()))?
 }
 
 fn parse_search_results_html(html: &str) -> Vec<Anime> {
@@ -219,6 +246,24 @@ mod tests {
         assert_eq!(catalog.groups[1].id, "target_group");
         assert_eq!(catalog.groups[1].options[0].label, "Josei");
         assert_eq!(catalog.letters, vec!["A", "1"]);
+    }
+
+    #[test]
+    fn parses_the_requested_page_and_last_page_from_search_pagination() {
+        let html = r#"
+            <div class="div-row"><h3><a href="/series/1-alpha">Alpha</a></h3></div>
+            <nav class="pagination">
+                <a href="/series?search=alpha&amp;page=2">2</a>
+                <span class="active">3</span>
+                <a href="/series?search=alpha&amp;page=8">8</a>
+            </nav>
+        "#;
+
+        let page = parse_search_results_page_html(html, 3);
+
+        assert_eq!(page.current_page, 3);
+        assert_eq!(page.total_pages, 8);
+        assert_eq!(page.items.len(), 1);
     }
 }
 

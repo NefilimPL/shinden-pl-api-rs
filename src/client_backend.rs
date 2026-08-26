@@ -374,6 +374,14 @@ pub struct SearchAnime {
 }
 
 #[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchAnimePage {
+    pub items: Vec<SearchAnime>,
+    pub current_page: u32,
+    pub total_pages: u32,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct DiscoveryAnime {
     pub name: String,
     pub url: String,
@@ -512,8 +520,8 @@ impl ShindenClientBackend {
     pub async fn search_with_filters(
         &self,
         request: SearchFilterRequest,
-    ) -> Result<Vec<SearchAnime>, String> {
-        let results = self
+    ) -> Result<SearchAnimePage, String> {
+        let page = self
             .api
             .search_anime_with_filters(&request)
             .await
@@ -523,7 +531,11 @@ impl ShindenClientBackend {
             .await
             .unwrap_or_default();
 
-        Ok(map_search_anime_results(results, watching_items))
+        Ok(SearchAnimePage {
+            items: map_search_anime_results(page.items, watching_items),
+            current_page: page.current_page,
+            total_pages: page.total_pages,
+        })
     }
 
     pub async fn get_main_premieres(&self) -> Result<Vec<DiscoveryAnime>, String> {

@@ -165,12 +165,14 @@ fn filtered_search_request_keeps_only_public_tag_selection_data() {
         tags: vec![SearchTagSelection::include(5), SearchTagSelection::exclude(39)],
         genres_type: "all".to_string(),
         letter: None,
+        page: 1,
     };
 
     let json = serde_json::to_value(request).expect("filtered search request serializes");
 
     assert_eq!(json["query"], "Cowboy Bebop");
     assert_eq!(json["genresType"], "all");
+    assert_eq!(json["page"], 1);
     assert_eq!(json["tags"][0]["tagId"], 5);
     assert_eq!(json["tags"][0]["mode"], "include");
     assert_eq!(json["tags"][1]["mode"], "exclude");

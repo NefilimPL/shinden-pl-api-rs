@@ -66,10 +66,24 @@ pub struct SearchFilterRequest {
     pub genres_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub letter: Option<String>,
+    #[serde(default = "default_search_page")]
+    pub page: u32,
 }
 
 fn default_search_genres_type() -> String {
     "all".to_string()
+}
+
+fn default_search_page() -> u32 {
+    1
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResultsPage {
+    pub items: Vec<Anime>,
+    pub current_page: u32,
+    pub total_pages: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
