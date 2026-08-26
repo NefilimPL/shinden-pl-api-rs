@@ -324,14 +324,16 @@ pub fn anime_rating_url(title_type: &str, title_id: u64) -> String {
 }
 
 pub fn basic_auth_token(html: &str) -> Option<String> {
-    let marker = "_Storage.basic";
-    let start = html.find(marker)?;
-    let after_marker = &html[start + marker.len()..];
-    let quote_start = after_marker.find('\'')? + 1;
-    let after_quote = &after_marker[quote_start..];
-    let quote_end = after_quote.find('\'')?;
-    let token = after_quote[..quote_end].trim();
-    (!token.is_empty()).then(|| token.to_string())
+    ["_Storage.basic = \"", "_Storage.basic=\"", "_Storage.basic = '", "_Storage.basic='"]
+        .iter()
+        .find_map(|marker| {
+            let value = html
+                .split_once(marker)
+                .map(|(_, value)| value)?;
+            let quote = marker.chars().last()?;
+            let token = value.split(quote).next()?.trim();
+            (!token.is_empty()).then(|| token.to_string())
+        })
 }
 
 fn text_from_selector(doc: &Html, selector: &str) -> String {
@@ -489,6 +491,13 @@ mod tests {
         let html = "<script>_Storage.basic = 'abc123';</script>";
 
         assert_eq!(basic_auth_token(html).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn basic_auth_token_extracts_double_quoted_storage_value() {
+        let html = r#"<script>_Storage.basic = "current-token";</script>"#;
+
+        assert_eq!(basic_auth_token(html).as_deref(), Some("current-token"));
     }
 
     #[test]

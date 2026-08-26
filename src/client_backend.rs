@@ -3,7 +3,7 @@ use crate::details::{
     AnimeDetails, AnimeRatingUpdate, anime_rating_url, basic_auth_token, normalize_rating_type,
     rating_update_form,
 };
-use crate::models::{Anime, Episode, Player};
+use crate::models::{Anime, Episode, Player, SearchFilterCatalog, SearchFilterRequest};
 use futures_util::stream::{self, StreamExt};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, ORIGIN, REFERER};
 use serde::{Deserialize, Serialize};
@@ -374,6 +374,14 @@ pub struct SearchAnime {
 }
 
 #[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchAnimePage {
+    pub items: Vec<SearchAnime>,
+    pub current_page: u32,
+    pub total_pages: u32,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct DiscoveryAnime {
     pub name: String,
     pub url: String,
@@ -500,6 +508,34 @@ impl ShindenClientBackend {
             .unwrap_or_default();
 
         Ok(map_search_anime_results(results, watching_items))
+    }
+
+    pub async fn get_search_filter_catalog(&self) -> Result<SearchFilterCatalog, String> {
+        self.api
+            .get_search_filter_catalog()
+            .await
+            .map_err(|error| command_error("get_search_filter_catalog", error))
+    }
+
+    pub async fn search_with_filters(
+        &self,
+        request: SearchFilterRequest,
+    ) -> Result<SearchAnimePage, String> {
+        let page = self
+            .api
+            .search_anime_with_filters(&request)
+            .await
+            .map_err(|error| command_error("search_with_filters", error))?;
+
+        let watching_items = fetch_all_userlist_items(&self.api, &self.user_id_cache)
+            .await
+            .unwrap_or_default();
+
+        Ok(SearchAnimePage {
+            items: map_search_anime_results(page.items, watching_items),
+            current_page: page.current_page,
+            total_pages: page.total_pages,
+        })
     }
 
     pub async fn get_main_premieres(&self) -> Result<Vec<DiscoveryAnime>, String> {
@@ -2379,6 +2415,8 @@ fn parse_discovery_links(html: &str, include_source_label: bool) -> Vec<Discover
         }
 
         let context = nearby_context(html, anchor_start, close);
+        let rating_context = enclosing_discovery_card(html, anchor_start, close)
+            .unwrap_or(anchor_body);
         let (anime_type, episodes) = extract_type_and_episodes(&context);
         let source_label = include_source_label
             .then(|| extract_episode_label(&context))
@@ -2392,7 +2430,7 @@ fn parse_discovery_links(html: &str, include_source_label: bool) -> Vec<Discover
                 absolute_shinden_url(&image_url)
             },
             anime_type,
-            rating: extract_rating(&context),
+            rating: extract_rating(rating_context),
             episodes,
             description: String::new(),
             title_id: Some(title_id),
@@ -2544,6 +2582,18 @@ fn nearby_context(html: &str, start: usize, end: usize) -> String {
     html[context_start..context_end].to_string()
 }
 
+fn enclosing_discovery_card(html: &str, start: usize, end: usize) -> Option<&str> {
+    ["article", "li"].iter().find_map(|tag| {
+        let opening_start = html[..start].rfind(&format!("<{tag}"))?;
+        let opening_end = opening_start + html[opening_start..].find('>')?;
+        let closing_marker = format!("</{tag}>");
+        let closing_start = opening_end + html[opening_end..].find(&closing_marker)?;
+        let closing_end = closing_start + closing_marker.len();
+
+        (closing_end >= end).then_some(&html[opening_start..closing_end])
+    })
+}
+
 fn extract_type_and_episodes(context: &str) -> (String, String) {
     let compact = compact_text(context);
     let tokens: Vec<&str> = compact.split_whitespace().collect();
@@ -2605,21 +2655,25 @@ fn extract_episode_label(context: &str) -> Option<String> {
 }
 
 fn extract_rating(context: &str) -> String {
-    let compact = compact_text(context);
-    compact
-        .split_whitespace()
-        .find(|token| {
-            let mut parts = token.split(',');
-            parts.next().is_some_and(|part| {
-                !part.is_empty()
-                    && part.len() <= 2
-                    && part.chars().all(|character| character.is_ascii_digit())
-            }) && parts.next().is_some_and(|part| {
-                part.len() == 1 && part.chars().all(|character| character.is_ascii_digit())
-            })
-        })
+    ["data-rate", "data-rating", "data-score"]
+        .iter()
+        .find_map(|attribute| extract_attr(context, attribute))
+        .and_then(|value| normalize_rating(&value))
+        .or_else(|| compact_text(context).split_whitespace().find_map(normalize_rating))
         .unwrap_or_default()
-        .to_string()
+}
+
+fn normalize_rating(value: &str) -> Option<String> {
+    let value = value
+        .trim_matches(|character: char| !character.is_ascii_digit() && character != ',' && character != '.')
+        .replace('.', ",");
+    let (whole, fraction) = value.split_once(',')?;
+
+    (whole.parse::<u8>().ok()? <= 10
+        && !fraction.is_empty()
+        && fraction.len() <= 2
+        && fraction.chars().all(|character| character.is_ascii_digit()))
+        .then_some(value)
 }
 
 fn shinden_watch_status_value(status: Option<&str>) -> Result<Option<&'static str>, String> {
@@ -4061,6 +4115,29 @@ mod tests {
         assert_eq!(
             rows[0].image_url,
             "https://shinden.pl/res/images/225x350/435918.jpg"
+        );
+    }
+
+    #[test]
+    fn parses_card_ratings_without_leaking_between_cards() {
+        let html = r#"
+            <article data-rate="8.25">
+                <a href="/series/60001-alpha"><img alt="Alpha" /></a>
+            </article>
+            <article>
+                <a href="/series/60002-beta"><img alt="Beta" /></a>
+                <span class="rate-top">7,4</span>
+            </article>
+            <article>
+                <a href="/series/60003-gamma"><img alt="Gamma" /></a>
+            </article>
+        "#;
+
+        let rows = parse_main_premieres_html(html);
+
+        assert_eq!(
+            rows.iter().map(|row| row.rating.as_str()).collect::<Vec<_>>(),
+            vec!["8,25", "7,4", ""],
         );
     }
 
