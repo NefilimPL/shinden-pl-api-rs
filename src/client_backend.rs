@@ -678,16 +678,24 @@ impl ShindenClientBackend {
                 let existing_keys = user_anime_list_cache_keys(&cache);
                 merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
                 let new_keys = new_active_user_anime_list_cache_keys(&cache, &existing_keys);
-                let sync_error = refresh_new_user_anime_detail_metadata(
-                    &self.api,
-                    &mut cache,
-                    new_keys,
-                    now_ms,
-                )
-                .await;
                 let active_items = active_user_anime_list_items(&cache);
                 cache.refreshed_at_ms = Some(now_ms);
                 save_user_anime_list_cache(&cache)?;
+
+                let sync_error = if force_refresh {
+                    refresh_new_user_anime_detail_metadata(
+                        &self.api,
+                        &mut cache,
+                        new_keys,
+                        now_ms,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                if force_refresh {
+                    save_user_anime_list_cache(&cache)?;
+                }
 
                 Ok(user_anime_lists_payload(
                     active_items,
@@ -2865,11 +2873,19 @@ async fn process_user_anime_list_refresh_queue(
         })?;
 
         let key = state.queue[index].key.clone();
+        let title_id = state.queue[index].title_id;
         let title = state.queue[index].title.clone();
         let url = state.queue[index].url.clone();
 
-        wait_before_background_request().await;
-        match api.get_anime_details(&url).await {
+        let details = match resolve_playback_title_url(api, title_id, &title, &url).await {
+            Ok(url) => {
+                wait_before_background_request().await;
+                api.get_anime_details(&url).await.map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error),
+        };
+
+        match details {
             Ok(details) => {
                 if let Some(item) = cache.items.get_mut(&key) {
                     apply_user_anime_details_to_item(item, &details);
