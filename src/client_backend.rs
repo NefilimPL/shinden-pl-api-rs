@@ -2065,7 +2065,7 @@ fn normalize_season_slug(season: &str) -> Option<String> {
         "winter" | "zima" => Some("winter".to_string()),
         "spring" | "wiosna" => Some("spring".to_string()),
         "summer" | "lato" => Some("summer".to_string()),
-        "fall" | "autumn" | "jesien" => Some("fall".to_string()),
+        "fall" | "autumn" | "jesien" => Some("autumn".to_string()),
         _ => None,
     }
 }
@@ -4014,6 +4014,14 @@ mod tests {
     }
 
     #[test]
+    fn season_page_url_uses_autumn_for_fall() {
+        assert_eq!(
+            season_page_url(Some(2026), "fall"),
+            "https://shinden.pl/series/season/2026/autumn"
+        );
+    }
+
+    #[test]
     fn season_page_url_can_use_current_shortcut() {
         assert_eq!(
             season_page_url(None, "current"),
@@ -4026,10 +4034,10 @@ mod tests {
         assert_eq!(normalize_season_slug("zima").as_deref(), Some("winter"));
         assert_eq!(normalize_season_slug("wiosna").as_deref(), Some("spring"));
         assert_eq!(normalize_season_slug("lato").as_deref(), Some("summer"));
-        assert_eq!(normalize_season_slug("jesien").as_deref(), Some("fall"));
+        assert_eq!(normalize_season_slug("jesien").as_deref(), Some("autumn"));
         assert_eq!(
             normalize_season_slug("jesie\u{0144}").as_deref(),
-            Some("fall")
+            Some("autumn")
         );
     }
 
