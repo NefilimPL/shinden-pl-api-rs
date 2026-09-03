@@ -309,6 +309,8 @@ pub struct UserAnimeListItem {
     pub total_episodes: Option<u32>,
     #[serde(rename = "releaseYear")]
     pub release_year: Option<u16>,
+    #[serde(default, rename = "releaseDate")]
+    pub release_date: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default, rename = "ageRating")]
@@ -2826,6 +2828,7 @@ fn map_user_anime_list_item(
         release_year: item
             .year
             .or_else(|| release_year_from_date(item.release_date.as_deref())),
+        release_date: item.release_date.clone(),
         tags: Vec::new(),
         age_rating: None,
         detail_metadata_loaded: false,
@@ -3997,6 +4000,7 @@ mod tests {
             watched_episodes_count: 1,
             total_episodes: Some(12),
             release_year: Some(2024),
+            release_date: None,
             tags: Vec::new(),
             age_rating: None,
             detail_metadata_loaded: false,
