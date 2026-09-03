@@ -309,6 +309,8 @@ pub struct UserAnimeListItem {
     pub total_episodes: Option<u32>,
     #[serde(rename = "releaseYear")]
     pub release_year: Option<u16>,
+    #[serde(default, rename = "releaseDate")]
+    pub release_date: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default, rename = "ageRating")]
@@ -2118,6 +2120,16 @@ async fn resolve_canonical_title_url(
     item: &WatchingListApiItem,
 ) -> Result<String, String> {
     wait_before_background_request().await;
+    let exact_results = api
+        .search_anime_exact(&item.title)
+        .await
+        .map_err(|error| command_error("resolve_canonical_title_url exact search", error))?;
+
+    if let Some(url) = canonical_title_url_from_search_results(item.title_id, &exact_results) {
+        return Ok(url);
+    }
+
+    wait_before_background_request().await;
     let results = api
         .search_anime(&item.title)
         .await
@@ -2150,6 +2162,18 @@ async fn resolve_playback_title_url(
 
     if let Some(url) = cached_canonical_title_urls(&load_user_anime_list_cache()).get(&title_id) {
         return Ok(url.clone());
+    }
+
+    wait_before_background_request().await;
+    let exact_results = api
+        .search_anime_exact(title_name)
+        .await
+        .map_err(|error| command_error("resolve_playback_title_url exact search", error))?;
+
+    if let Some(url) = canonical_title_url_from_search_results(title_id, &exact_results) {
+        cache.canonical_title_urls.insert(title_id, url.clone());
+        save_watching_availability_cache(&cache)?;
+        return Ok(url);
     }
 
     wait_before_background_request().await;
@@ -2826,6 +2850,7 @@ fn map_user_anime_list_item(
         release_year: item
             .year
             .or_else(|| release_year_from_date(item.release_date.as_deref())),
+        release_date: item.release_date.clone(),
         tags: Vec::new(),
         age_rating: None,
         detail_metadata_loaded: false,
@@ -3997,6 +4022,7 @@ mod tests {
             watched_episodes_count: 1,
             total_episodes: Some(12),
             release_year: Some(2024),
+            release_date: None,
             tags: Vec::new(),
             age_rating: None,
             detail_metadata_loaded: false,

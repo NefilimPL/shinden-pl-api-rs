@@ -17,6 +17,16 @@ impl ShindenAPI {
         }).await.map(|page| page.items)
     }
 
+    pub async fn search_anime_exact(&self, name: &str) -> Result<Vec<Anime>> {
+        let request = SearchFilterRequest {
+            query: name.to_string(),
+            ..Default::default()
+        };
+        let html = self.get_html(search_url_for_exact_title(&request)?.as_str()).await?;
+
+        Ok(parse_search_results_page_html(&html, request.page).items)
+    }
+
     pub async fn get_search_filter_catalog(&self) -> Result<SearchFilterCatalog> {
         let html = self.get_html("https://shinden.pl/series?").await?;
         Ok(parse_search_filter_catalog_html(&html))
@@ -46,25 +56,35 @@ impl ShindenAPI {
             }
         }
 
-        let mut search_url = Url::parse("https://shinden.pl/series")?;
-        {
-            let mut query = search_url.query_pairs_mut();
-            query.append_pair("type", "contains");
-            query.append_pair("search", request.query.trim());
-            query.append_pair("page", &request.page.max(1).to_string());
-            if !request.tags.is_empty() {
-                query.append_pair("genres-type", search_genres_type(&request.genres_type));
-                query.append_pair("genres", &encode_search_genres(&request.tags));
-            }
-            if let Some(letter) = request.letter.as_deref() {
-                query.append_pair("letter", letter);
-            }
-        }
+        let search_url = search_url_for_request(request, "contains")?;
         let html = self.get_html(search_url.as_str()).await?;
 
         Ok(parse_search_results_page_html(&html, request.page))
     }
 
+}
+
+fn search_url_for_exact_title(request: &SearchFilterRequest) -> Result<Url> {
+    search_url_for_request(request, "equals")
+}
+
+fn search_url_for_request(request: &SearchFilterRequest, search_type: &str) -> Result<Url> {
+    let mut search_url = Url::parse("https://shinden.pl/series")?;
+    {
+        let mut query = search_url.query_pairs_mut();
+        query.append_pair("type", search_type);
+        query.append_pair("search", request.query.trim());
+        query.append_pair("page", &request.page.max(1).to_string());
+        if !request.tags.is_empty() {
+            query.append_pair("genres-type", search_genres_type(&request.genres_type));
+            query.append_pair("genres", &encode_search_genres(&request.tags));
+        }
+        if let Some(letter) = request.letter.as_deref() {
+            query.append_pair("letter", letter);
+        }
+    }
+
+    Ok(search_url)
 }
 
 fn parse_search_results_page_html(html: &str, requested_page: u32) -> SearchResultsPage {
@@ -213,6 +233,21 @@ fn search_genres_type(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_title_search_uses_equals_match_type() {
+        let request = SearchFilterRequest {
+            query: "Tensei shitara Slime Datta Ken 4th Season".to_string(),
+            ..Default::default()
+        };
+
+        let url = search_url_for_exact_title(&request).expect("exact title search URL");
+
+        assert_eq!(
+            url.as_str(),
+            "https://shinden.pl/series?type=equals&search=Tensei+shitara+Slime+Datta+Ken+4th+Season&page=1",
+        );
+    }
 
     #[test]
     fn encodes_included_and_excluded_tags_for_shinden() {
