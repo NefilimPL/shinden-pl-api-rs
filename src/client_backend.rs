@@ -2120,6 +2120,16 @@ async fn resolve_canonical_title_url(
     item: &WatchingListApiItem,
 ) -> Result<String, String> {
     wait_before_background_request().await;
+    let exact_results = api
+        .search_anime_exact(&item.title)
+        .await
+        .map_err(|error| command_error("resolve_canonical_title_url exact search", error))?;
+
+    if let Some(url) = canonical_title_url_from_search_results(item.title_id, &exact_results) {
+        return Ok(url);
+    }
+
+    wait_before_background_request().await;
     let results = api
         .search_anime(&item.title)
         .await
@@ -2152,6 +2162,18 @@ async fn resolve_playback_title_url(
 
     if let Some(url) = cached_canonical_title_urls(&load_user_anime_list_cache()).get(&title_id) {
         return Ok(url.clone());
+    }
+
+    wait_before_background_request().await;
+    let exact_results = api
+        .search_anime_exact(title_name)
+        .await
+        .map_err(|error| command_error("resolve_playback_title_url exact search", error))?;
+
+    if let Some(url) = canonical_title_url_from_search_results(title_id, &exact_results) {
+        cache.canonical_title_urls.insert(title_id, url.clone());
+        save_watching_availability_cache(&cache)?;
+        return Ok(url);
     }
 
     wait_before_background_request().await;
