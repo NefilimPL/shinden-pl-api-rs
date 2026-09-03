@@ -313,6 +313,8 @@ pub struct UserAnimeListItem {
     pub tags: Vec<String>,
     #[serde(default, rename = "ageRating")]
     pub age_rating: Option<String>,
+    #[serde(default, rename = "detailMetadataLoaded")]
+    pub detail_metadata_loaded: bool,
     pub active: bool,
     #[serde(rename = "updatedAtMs")]
     pub updated_at_ms: u64,
@@ -676,16 +678,24 @@ impl ShindenClientBackend {
                 let existing_keys = user_anime_list_cache_keys(&cache);
                 merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
                 let new_keys = new_active_user_anime_list_cache_keys(&cache, &existing_keys);
-                let sync_error = refresh_new_user_anime_detail_metadata(
-                    &self.api,
-                    &mut cache,
-                    new_keys,
-                    now_ms,
-                )
-                .await;
                 let active_items = active_user_anime_list_items(&cache);
                 cache.refreshed_at_ms = Some(now_ms);
                 save_user_anime_list_cache(&cache)?;
+
+                let sync_error = if force_refresh {
+                    refresh_new_user_anime_detail_metadata(
+                        &self.api,
+                        &mut cache,
+                        new_keys,
+                        now_ms,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                if force_refresh {
+                    save_user_anime_list_cache(&cache)?;
+                }
 
                 Ok(user_anime_lists_payload(
                     active_items,
@@ -1895,17 +1905,7 @@ async fn scan_watching_item_availability(
         let availability = watching_episode_availability(&players);
 
         if episode_index >= watched_count {
-            let matches_filter = availability.has_players
-                && subtitle_cache_key
-                    .map(|cache_key| {
-                        availability
-                            .subtitle_availability
-                            .get(cache_key)
-                            .copied()
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(true);
-            has_available_unwatched_episode |= matches_filter;
+            has_available_unwatched_episode |= availability.has_players;
 
             for (cache_key, is_available) in &availability.subtitle_availability {
                 if *is_available {
@@ -2065,7 +2065,7 @@ fn normalize_season_slug(season: &str) -> Option<String> {
         "winter" | "zima" => Some("winter".to_string()),
         "spring" | "wiosna" => Some("spring".to_string()),
         "summer" | "lato" => Some("summer".to_string()),
-        "fall" | "autumn" | "jesien" => Some("fall".to_string()),
+        "fall" | "autumn" | "jesien" => Some("autumn".to_string()),
         _ => None,
     }
 }
@@ -2828,6 +2828,7 @@ fn map_user_anime_list_item(
             .or_else(|| release_year_from_date(item.release_date.as_deref())),
         tags: Vec::new(),
         age_rating: None,
+        detail_metadata_loaded: false,
         active: true,
         updated_at_ms,
     })
@@ -2842,7 +2843,7 @@ async fn refresh_user_anime_list_cache_inner(
     let now_ms = unix_timestamp_ms_u64();
     let items = fetch_all_userlist_items(api, user_id_cache).await?;
 
-    merge_user_anime_list_cache(&mut cache, items, true, now_ms);
+    merge_user_anime_list_cache(&mut cache, items, false, now_ms);
     cache.refreshed_at_ms = Some(now_ms);
     save_user_anime_list_cache(&cache)?;
 
@@ -2872,11 +2873,19 @@ async fn process_user_anime_list_refresh_queue(
         })?;
 
         let key = state.queue[index].key.clone();
+        let title_id = state.queue[index].title_id;
         let title = state.queue[index].title.clone();
         let url = state.queue[index].url.clone();
 
-        wait_before_background_request().await;
-        match api.get_anime_details(&url).await {
+        let details = match resolve_playback_title_url(api, title_id, &title, &url).await {
+            Ok(url) => {
+                wait_before_background_request().await;
+                api.get_anime_details(&url).await.map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error),
+        };
+
+        match details {
             Ok(details) => {
                 if let Some(item) = cache.items.get_mut(&key) {
                     apply_user_anime_details_to_item(item, &details);
@@ -2929,7 +2938,7 @@ fn build_user_anime_list_refresh_state(
     let mut queue: Vec<UserAnimeListRefreshQueueItem> = cache
         .items
         .iter()
-        .filter(|(_, item)| item.active)
+        .filter(|(_, item)| user_anime_list_item_needs_detail_metadata(item))
         .map(|(key, item)| UserAnimeListRefreshQueueItem {
             key: key.clone(),
             title_id: item.title_id,
@@ -2953,6 +2962,10 @@ fn build_user_anime_list_refresh_state(
         last_finished_at_ms: None,
         last_error: None,
     }
+}
+
+fn user_anime_list_item_needs_detail_metadata(item: &UserAnimeListItem) -> bool {
+    item.active && !item.detail_metadata_loaded && item.tags.is_empty() && item.age_rating.is_none()
 }
 
 fn user_anime_list_refresh_state_has_pending(state: &UserAnimeListRefreshState) -> bool {
@@ -3058,6 +3071,7 @@ fn apply_user_anime_details_to_item(item: &mut UserAnimeListItem, details: &Anim
 
     item.tags = anime_detail_tags(details);
     item.age_rating = anime_detail_age_rating(details);
+    item.detail_metadata_loaded = true;
 }
 
 fn anime_detail_tags(details: &AnimeDetails) -> Vec<String> {
@@ -3111,6 +3125,7 @@ fn merge_user_anime_list_cache(
                 if let Some(existing) = cache.items.get(&cache_key) {
                     mapped.tags = existing.tags.clone();
                     mapped.age_rating = existing.age_rating.clone();
+                    mapped.detail_metadata_loaded = existing.detail_metadata_loaded;
                 }
             }
             cache.items.insert(cache_key, mapped);
@@ -3336,7 +3351,12 @@ fn watching_cache_filter_matches(
         return false;
     };
 
-    if !cache_entry_matches_item(entry, item) || !entry.has_available_unwatched_episode {
+    let has_available_unwatched_episode = entry.has_available_unwatched_episode
+        || entry
+            .subtitle_availability
+            .values()
+            .any(|available| *available);
+    if !cache_entry_matches_item(entry, item) || !has_available_unwatched_episode {
         return false;
     }
 
@@ -3979,6 +3999,7 @@ mod tests {
             release_year: Some(2024),
             tags: Vec::new(),
             age_rating: None,
+            detail_metadata_loaded: false,
             active,
             updated_at_ms: 5_000,
         }
@@ -3989,6 +4010,14 @@ mod tests {
         assert_eq!(
             season_page_url(Some(2026), "winter"),
             "https://shinden.pl/series/season/2026/winter"
+        );
+    }
+
+    #[test]
+    fn season_page_url_uses_autumn_for_fall() {
+        assert_eq!(
+            season_page_url(Some(2026), "fall"),
+            "https://shinden.pl/series/season/2026/autumn"
         );
     }
 
@@ -4005,10 +4034,10 @@ mod tests {
         assert_eq!(normalize_season_slug("zima").as_deref(), Some("winter"));
         assert_eq!(normalize_season_slug("wiosna").as_deref(), Some("spring"));
         assert_eq!(normalize_season_slug("lato").as_deref(), Some("summer"));
-        assert_eq!(normalize_season_slug("jesien").as_deref(), Some("fall"));
+        assert_eq!(normalize_season_slug("jesien").as_deref(), Some("autumn"));
         assert_eq!(
             normalize_season_slug("jesie\u{0144}").as_deref(),
-            Some("fall")
+            Some("autumn")
         );
     }
 
@@ -4588,6 +4617,24 @@ mod tests {
             user_anime_list_refresh_status_from_state(&state, false).total,
             2
         );
+    }
+
+    #[test]
+    fn user_list_refresh_state_queues_only_titles_missing_detail_metadata() {
+        let mut cache = UserAnimeListCache::default();
+        let mut complete = cached_user_anime_fixture(1, "Complete", "completed", true);
+        complete.tags = vec!["Fantasy".to_string()];
+        complete.age_rating = Some("PG-13".to_string());
+        cache.items.insert("1".to_string(), complete);
+        cache.items.insert(
+            "2".to_string(),
+            cached_user_anime_fixture(2, "Missing metadata", "plan", true),
+        );
+
+        let state = build_user_anime_list_refresh_state(&cache, 20_000);
+        let queued_keys: Vec<&str> = state.queue.iter().map(|item| item.key.as_str()).collect();
+
+        assert_eq!(queued_keys, vec!["2"]);
     }
 
     #[test]
@@ -5182,6 +5229,30 @@ mod tests {
         );
 
         assert!(!watching_cache_filter_matches(&item, &filter, &cache));
+    }
+
+    #[test]
+    fn cache_filter_keeps_ipl_only_title_when_language_filters_are_disabled() {
+        let item = watching_item(Some("2"), Some(3));
+        let filter = WatchingAnimeFilter {
+            only_available_unwatched: Some(true),
+            ..Default::default()
+        };
+        let mut cache = WatchingAvailabilityCache::default();
+        cache.entries.insert(
+            "59922".to_string(),
+            WatchingAvailabilityCacheEntry {
+                title_id: 59922,
+                watched_episodes_cnt: 2,
+                total_episodes: Some(3),
+                has_available_unwatched_episode: false,
+                subtitle_availability: HashMap::from([("pl".to_string(), true)]),
+                episode_availability: Default::default(),
+                checked_at_ms: 1000,
+            },
+        );
+
+        assert!(watching_cache_filter_matches(&item, &filter, &cache));
     }
 
     #[test]
