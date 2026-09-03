@@ -105,6 +105,7 @@ fn frontend_contract_types_keep_expected_json_shape() {
         release_year: Some(2025),
         tags: vec!["Komedia".to_string(), "Fantasy".to_string()],
         age_rating: Some("R17+".to_string()),
+        detail_metadata_loaded: true,
         active: true,
         updated_at_ms: 10,
     };
