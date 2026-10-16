@@ -74,5 +74,14 @@ async fn main() -> Result<()> {
 }
 ```
 
+## Security scanning
+
+Shinden's list API requires the public numeric profile identifier from
+`/animelist/<id>-<slug>` links in its HTTPS request paths. Internally this value is
+named `public_profile_id` to distinguish it from credentials and session tokens.
+CodeQL's `rust/cleartext-transmission` rule uses name-based sensitive-data
+heuristics and can flag generic `user_id` values in URLs even over HTTPS.
+See the [CodeQL rule documentation](https://codeql.github.com/codeql-query-help/rust/rust-cleartext-transmission/).
+
 # LICENSE
 This project is licensed under the MIT License.
