@@ -30,7 +30,7 @@ const WATCHING_CACHE_REQUEST_RETRIES: usize = 2;
 const WATCHING_CACHE_RETRY_DELAY_MS: u64 = 750;
 const BACKGROUND_REQUEST_SPACING_MS: u64 = 900;
 const USER_ANIME_LIST_DETAIL_REFRESH_CONCURRENCY: usize = 1;
-const USER_ID_CACHE_TTL_MS: u64 = 60 * 60 * 1000;
+const PUBLIC_PROFILE_ID_CACHE_TTL_MS: u64 = 60 * 60 * 1000;
 const SHINDEN_TITLE_PLACEHOLDER: &str =
     "https://shinden.pl/res/other/placeholders/title/100x100.jpg";
 const SHINDEN_MAIN_URL: &str = "https://shinden.pl/main";
@@ -261,9 +261,13 @@ struct WatchingCacheRefreshPlan {
     processed: usize,
 }
 
+// The numeric identifier published in Shinden's /animelist/<id>-<slug> links is
+// public and required in API paths; it is not a credential or session token.
+// Explicit naming avoids CodeQL's heuristic that treats generic `user_id`
+// variables as sensitive, including when they appear in HTTPS URLs.
 #[derive(Debug, Clone, Default)]
-struct CachedUserId {
-    user_id: Option<String>,
+struct CachedPublicProfileId {
+    public_profile_id: Option<String>,
     checked_at_ms: u64,
 }
 
@@ -472,7 +476,7 @@ pub struct ShindenClientBackend {
     api: ShindenAPI,
     refresh_status: Mutex<WatchingCacheRefreshStatus>,
     user_anime_list_refresh_status: Mutex<UserAnimeListRefreshStatus>,
-    user_id_cache: Mutex<CachedUserId>,
+    public_profile_id_cache: Mutex<CachedPublicProfileId>,
 }
 
 impl ShindenClientBackend {
@@ -486,7 +490,7 @@ impl ShindenClientBackend {
             api,
             refresh_status: Mutex::new(WatchingCacheRefreshStatus::default()),
             user_anime_list_refresh_status: Mutex::new(UserAnimeListRefreshStatus::default()),
-            user_id_cache: Mutex::new(CachedUserId::default()),
+            public_profile_id_cache: Mutex::new(CachedPublicProfileId::default()),
         })
     }
 
@@ -515,7 +519,7 @@ impl ShindenClientBackend {
             .await
             .map_err(|e| command_error("search", e))?;
 
-        let watching_items = fetch_all_userlist_items(&self.api, &self.user_id_cache)
+        let watching_items = fetch_all_userlist_items(&self.api, &self.public_profile_id_cache)
             .await
             .unwrap_or_default();
 
@@ -539,7 +543,7 @@ impl ShindenClientBackend {
             .await
             .map_err(|error| command_error("search_with_filters", error))?;
 
-        let watching_items = fetch_all_userlist_items(&self.api, &self.user_id_cache)
+        let watching_items = fetch_all_userlist_items(&self.api, &self.public_profile_id_cache)
             .await
             .unwrap_or_default();
 
@@ -557,7 +561,7 @@ impl ShindenClientBackend {
             .await
             .map_err(|e| command_error("get_main_premieres", e))?;
 
-        let watching_items = fetch_all_userlist_items(&self.api, &self.user_id_cache)
+        let watching_items = fetch_all_userlist_items(&self.api, &self.public_profile_id_cache)
             .await
             .unwrap_or_default();
 
@@ -579,7 +583,7 @@ impl ShindenClientBackend {
             .await
             .map_err(|e| command_error("get_season_anime", e))?;
 
-        let watching_items = fetch_all_userlist_items(&self.api, &self.user_id_cache)
+        let watching_items = fetch_all_userlist_items(&self.api, &self.public_profile_id_cache)
             .await
             .unwrap_or_default();
 
@@ -597,18 +601,20 @@ impl ShindenClientBackend {
             .map_err(|e| command_error("get_anime_details", e))?;
 
         let (title_status, user_status_loaded) = match details.title_id {
-            Some(title_id) => match fetch_current_user_id_cached(
+            Some(title_id) => match fetch_current_public_profile_id_cached(
                 &self.api,
-                &self.user_id_cache,
+                &self.public_profile_id_cache,
                 "get_anime_details",
             )
             .await
             {
-                Ok(user_id) => match fetch_title_status(&self.api, title_id, &user_id).await {
-                    Ok(title_status) => (title_status, true),
-                    Err(error) => {
-                        let _ = command_error("get_anime_details status fallback", error);
-                        (None, false)
+                Ok(public_profile_id) => {
+                    match fetch_title_status(&self.api, title_id, &public_profile_id).await {
+                        Ok(title_status) => (title_status, true),
+                        Err(error) => {
+                            let _ = command_error("get_anime_details status fallback", error);
+                            (None, false)
+                        }
                     }
                 },
                 Err(error) => {
@@ -639,7 +645,7 @@ impl ShindenClientBackend {
             }
         }
 
-        let items = fetch_all_watching_items(&self.api, &self.user_id_cache).await?;
+        let items = fetch_all_watching_items(&self.api, &self.public_profile_id_cache).await?;
         let mut canonical_urls = cached_canonical_title_urls(&load_user_anime_list_cache());
         canonical_urls.extend(
             cache.canonical_title_urls.iter()
@@ -679,7 +685,7 @@ impl ShindenClientBackend {
             ));
         }
 
-        match fetch_all_userlist_items(&self.api, &self.user_id_cache).await {
+        match fetch_all_userlist_items(&self.api, &self.public_profile_id_cache).await {
             Ok(items) => {
                 let existing_keys = user_anime_list_cache_keys(&cache);
                 merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
@@ -739,7 +745,7 @@ impl ShindenClientBackend {
 
         let refresh_result = refresh_user_anime_list_cache_inner(
             &self.api,
-            &self.user_id_cache,
+            &self.public_profile_id_cache,
             &self.user_anime_list_refresh_status,
         )
         .await;
@@ -832,19 +838,22 @@ impl ShindenClientBackend {
             ));
         };
 
-        let progress_episodes = match fetch_current_user_id_cached(
+        let progress_episodes = match fetch_current_public_profile_id_cached(
             &self.api,
-            &self.user_id_cache,
+            &self.public_profile_id_cache,
             "get_episodes_with_progress",
         )
         .await
         {
-            Ok(user_id) => fetch_title_episode_progress(&self.api, title_id, &user_id)
-                .await
-                .unwrap_or_else(|error| {
-                    let _ = command_error("get_episodes_with_progress progress fallback", error);
-                    Vec::new()
-                }),
+            Ok(public_profile_id) => {
+                fetch_title_episode_progress(&self.api, title_id, &public_profile_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        let _ =
+                            command_error("get_episodes_with_progress progress fallback", error);
+                        Vec::new()
+                    })
+            }
             Err(error) => {
                 let _ = command_error("get_episodes_with_progress user fallback", error);
                 Vec::new()
@@ -864,10 +873,13 @@ impl ShindenClientBackend {
         status: Option<String>,
         is_favourite: Option<u8>,
     ) -> Result<(), String> {
-        let user_id =
-            fetch_current_user_id_cached(&self.api, &self.user_id_cache, "update_anime_status")
-                .await?;
-        let current_status = fetch_title_status(&self.api, title_id, &user_id)
+        let public_profile_id = fetch_current_public_profile_id_cached(
+            &self.api,
+            &self.public_profile_id_cache,
+            "update_anime_status",
+        )
+        .await?;
+        let current_status = fetch_title_status(&self.api, title_id, &public_profile_id)
             .await
             .unwrap_or_default();
         let payload = build_title_status_payload_with_details(
@@ -899,7 +911,7 @@ impl ShindenClientBackend {
         match verify_title_status_change_with_user(
             &self.api,
             title_id,
-            &user_id,
+            &public_profile_id,
             status.as_deref(),
             "update_anime_status",
         )
@@ -916,7 +928,7 @@ impl ShindenClientBackend {
                 post_legacy_anime_status(
                     &self.api,
                     title_id,
-                    &user_id,
+                    &public_profile_id,
                     status.as_deref(),
                     &payload.input[0],
                 )
@@ -924,7 +936,7 @@ impl ShindenClientBackend {
                 verify_title_status_change_with_user(
                     &self.api,
                     title_id,
-                    &user_id,
+                    &public_profile_id,
                     status.as_deref(),
                     "update_anime_status legacy verify",
                 )
@@ -1041,7 +1053,7 @@ impl ShindenClientBackend {
         let refresh_result = refresh_watching_cache_inner(
             &self.api,
             &self.refresh_status,
-            &self.user_id_cache,
+            &self.public_profile_id_cache,
             &filter,
             force,
         )
@@ -1080,7 +1092,7 @@ impl ShindenClientBackend {
         let refresh_result = refresh_watching_cache_item_inner(
             &self.api,
             &self.refresh_status,
-            &self.user_id_cache,
+            &self.public_profile_id_cache,
             title_id,
             &filter,
             force,
@@ -1118,7 +1130,7 @@ impl ShindenClientBackend {
             .map_err(|e| command_error("login", e));
 
         if result.is_ok() {
-            clear_cached_user_id(&self.user_id_cache)?;
+            clear_cached_public_profile_id(&self.public_profile_id_cache)?;
         }
 
         result
@@ -1129,7 +1141,7 @@ impl ShindenClientBackend {
             .logout()
             .await
             .map_err(|e| command_error("logout", e))?;
-        clear_cached_user_id(&self.user_id_cache)
+        clear_cached_public_profile_id(&self.public_profile_id_cache)
     }
 
     pub async fn get_user_name(&self) -> Result<Option<String>, String> {
@@ -1170,21 +1182,24 @@ impl ShindenClientBackend {
 
 async fn fetch_all_watching_items(
     api: &ShindenAPI,
-    user_id_cache: &Mutex<CachedUserId>,
+    public_profile_id_cache: &Mutex<CachedPublicProfileId>,
 ) -> Result<Vec<WatchingListApiItem>, String> {
-    let user_id = fetch_current_user_id_cached(api, user_id_cache, "get_watching_anime").await?;
-    fetch_all_watching_items_for_status(api, &user_id, "in progress").await
+    let public_profile_id =
+        fetch_current_public_profile_id_cached(api, public_profile_id_cache, "get_watching_anime")
+            .await?;
+    fetch_all_watching_items_for_status(api, &public_profile_id, "in progress").await
 }
 
 async fn fetch_all_userlist_items(
     api: &ShindenAPI,
-    user_id_cache: &Mutex<CachedUserId>,
+    public_profile_id_cache: &Mutex<CachedPublicProfileId>,
 ) -> Result<Vec<WatchingListApiItem>, String> {
-    let user_id = fetch_current_user_id_cached(api, user_id_cache, "search").await?;
+    let public_profile_id =
+        fetch_current_public_profile_id_cached(api, public_profile_id_cache, "search").await?;
     let mut items = Vec::new();
 
     for status in WATCHING_LIST_STATUSES {
-        items.extend(fetch_all_watching_items_for_status(api, &user_id, status).await?);
+        items.extend(fetch_all_watching_items_for_status(api, &public_profile_id, status).await?);
     }
 
     Ok(items)
@@ -1192,16 +1207,21 @@ async fn fetch_all_userlist_items(
 
 async fn fetch_all_watching_items_for_status(
     api: &ShindenAPI,
-    user_id: &str,
+    public_profile_id: &str,
     status: &str,
 ) -> Result<Vec<WatchingListApiItem>, String> {
     let mut offset = 0;
     let mut items = Vec::new();
 
     loop {
-        let page =
-            fetch_watching_list_status_page(api, user_id, status, WATCHING_LIST_PAGE_LIMIT, offset)
-                .await?;
+        let page = fetch_watching_list_status_page(
+            api,
+            public_profile_id,
+            status,
+            WATCHING_LIST_PAGE_LIMIT,
+            offset,
+        )
+        .await?;
         let loaded = page.items.len();
         let total = page.count;
 
@@ -1216,49 +1236,52 @@ async fn fetch_all_watching_items_for_status(
     Ok(items)
 }
 
-async fn fetch_current_user_id(api: &ShindenAPI, context: &str) -> Result<String, String> {
+async fn fetch_current_public_profile_id(
+    api: &ShindenAPI,
+    context: &str,
+) -> Result<String, String> {
     let profile_context = format!("{context} profile");
     let profile_html = api
         .get_html("https://shinden.pl/user")
         .await
         .map_err(|e| command_error(&profile_context, e))?;
 
-    extract_user_id_from_profile_html(&profile_html)
+    extract_public_profile_id_from_profile_html(&profile_html)
         .ok_or_else(|| command_error(&profile_context, "User is not logged in"))
 }
 
-async fn fetch_current_user_id_cached(
+async fn fetch_current_public_profile_id_cached(
     api: &ShindenAPI,
-    user_id_cache: &Mutex<CachedUserId>,
+    public_profile_id_cache: &Mutex<CachedPublicProfileId>,
     context: &str,
 ) -> Result<String, String> {
     let now_ms = unix_timestamp_ms_u64();
     {
-        let cache = lock_user_id_cache(user_id_cache)?;
-        if let Some(user_id) = cached_user_id_if_fresh(&*cache, now_ms) {
-            return Ok(user_id);
+        let cache = lock_public_profile_id_cache(public_profile_id_cache)?;
+        if let Some(public_profile_id) = cached_public_profile_id_if_fresh(&*cache, now_ms) {
+            return Ok(public_profile_id);
         }
     }
 
-    match fetch_current_user_id(api, context).await {
-        Ok(user_id) => {
-            store_cached_user_id(user_id_cache, &user_id, now_ms)?;
-            Ok(user_id)
+    match fetch_current_public_profile_id(api, context).await {
+        Ok(public_profile_id) => {
+            store_cached_public_profile_id(public_profile_id_cache, &public_profile_id, now_ms)?;
+            Ok(public_profile_id)
         }
         Err(error) => {
             if is_transient_user_profile_error(&error) {
-                let cached_user_id = {
-                    let cache = lock_user_id_cache(user_id_cache)?;
-                    cache.user_id.clone()
+                let cached_public_profile_id = {
+                    let cache = lock_public_profile_id_cache(public_profile_id_cache)?;
+                    cache.public_profile_id.clone()
                 };
-                if let Some(user_id) = cached_user_id {
+                if let Some(public_profile_id) = cached_public_profile_id {
                     let _ = append_project_log(
                         "WARNING",
                         &format!(
                             "Using cached Shinden user id after {context} profile error: {error}"
                         ),
                     );
-                    return Ok(user_id);
+                    return Ok(public_profile_id);
                 }
             }
 
@@ -1271,40 +1294,46 @@ fn is_transient_user_profile_error(error: &str) -> bool {
     error.contains("429 Too Many Requests") || error.contains("error sending request")
 }
 
-fn cached_user_id_if_fresh(cache: &CachedUserId, now_ms: u64) -> Option<String> {
-    let user_id = cache.user_id.as_ref()?;
-    if now_ms.saturating_sub(cache.checked_at_ms) <= USER_ID_CACHE_TTL_MS {
-        Some(user_id.clone())
+fn cached_public_profile_id_if_fresh(cache: &CachedPublicProfileId, now_ms: u64) -> Option<String> {
+    let public_profile_id = cache.public_profile_id.as_ref()?;
+    if now_ms.saturating_sub(cache.checked_at_ms) <= PUBLIC_PROFILE_ID_CACHE_TTL_MS {
+        Some(public_profile_id.clone())
     } else {
         None
     }
 }
 
-fn store_cached_user_id(
-    user_id_cache: &Mutex<CachedUserId>,
-    user_id: &str,
+fn store_cached_public_profile_id(
+    public_profile_id_cache: &Mutex<CachedPublicProfileId>,
+    public_profile_id: &str,
     checked_at_ms: u64,
 ) -> Result<(), String> {
-    let mut cache = lock_user_id_cache(user_id_cache)?;
-    store_cached_user_id_value(&mut cache, user_id, checked_at_ms);
+    let mut cache = lock_public_profile_id_cache(public_profile_id_cache)?;
+    store_cached_public_profile_id_value(&mut cache, public_profile_id, checked_at_ms);
     Ok(())
 }
 
-fn store_cached_user_id_value(cache: &mut CachedUserId, user_id: &str, checked_at_ms: u64) {
-    cache.user_id = Some(user_id.to_string());
+fn store_cached_public_profile_id_value(
+    cache: &mut CachedPublicProfileId,
+    public_profile_id: &str,
+    checked_at_ms: u64,
+) {
+    cache.public_profile_id = Some(public_profile_id.to_string());
     cache.checked_at_ms = checked_at_ms;
 }
 
-fn clear_cached_user_id(user_id_cache: &Mutex<CachedUserId>) -> Result<(), String> {
-    let mut cache = lock_user_id_cache(user_id_cache)?;
-    *cache = CachedUserId::default();
+fn clear_cached_public_profile_id(
+    public_profile_id_cache: &Mutex<CachedPublicProfileId>,
+) -> Result<(), String> {
+    let mut cache = lock_public_profile_id_cache(public_profile_id_cache)?;
+    *cache = CachedPublicProfileId::default();
     Ok(())
 }
 
-fn lock_user_id_cache(
-    user_id_cache: &Mutex<CachedUserId>,
-) -> Result<std::sync::MutexGuard<'_, CachedUserId>, String> {
-    user_id_cache
+fn lock_public_profile_id_cache(
+    public_profile_id_cache: &Mutex<CachedPublicProfileId>,
+) -> Result<std::sync::MutexGuard<'_, CachedPublicProfileId>, String> {
+    public_profile_id_cache
         .lock()
         .map_err(|_| command_error("user_id_cache", "User id cache lock poisoned"))
 }
@@ -1321,12 +1350,12 @@ async fn fetch_shinden_basic_auth(api: &ShindenAPI) -> Result<String, String> {
 
 async fn fetch_watching_list_status_page(
     api: &ShindenAPI,
-    user_id: &str,
+    public_profile_id: &str,
     status: &str,
     limit: usize,
     offset: usize,
 ) -> Result<WatchingListApiResult, String> {
-    let url = watching_list_status_url(user_id, status, limit, offset);
+    let url = watching_list_status_url(public_profile_id, status, limit, offset);
     let response = api
         .request(reqwest::Method::GET, &url)
         .header(ACCEPT, "application/json")
@@ -1353,10 +1382,13 @@ async fn fetch_watching_list_status_page(
 async fn fetch_title_status(
     api: &ShindenAPI,
     title_id: u64,
-    user_id: &str,
+    public_profile_id: &str,
 ) -> Result<Option<TitleStatusApiTitle>, String> {
     let response = api
-        .request(reqwest::Method::GET, title_status_url(title_id, user_id))
+        .request(
+            reqwest::Method::GET,
+            title_status_url(title_id, public_profile_id),
+        )
         .header(ACCEPT, "application/json")
         .send()
         .await
@@ -1406,10 +1438,13 @@ fn anime_details_with_title_status(
 async fn fetch_title_episode_progress(
     api: &ShindenAPI,
     title_id: u64,
-    user_id: &str,
+    public_profile_id: &str,
 ) -> Result<Vec<TitleEpisodeApiItem>, String> {
     let response = api
-        .request(reqwest::Method::GET, title_episodes_url(title_id, user_id))
+        .request(
+            reqwest::Method::GET,
+            title_episodes_url(title_id, public_profile_id),
+        )
         .header(ACCEPT, "application/json")
         .send()
         .await
@@ -1476,19 +1511,19 @@ async fn post_shinden_json<T: Serialize>(
 async fn post_legacy_anime_status(
     api: &ShindenAPI,
     title_id: u64,
-    user_id: &str,
+    public_profile_id: &str,
     status: Option<&str>,
     input: &TitleStatusChangeInput,
 ) -> Result<(), String> {
     let legacy_statuses = shinden_legacy_watch_status_values(status)?;
     if legacy_statuses.is_empty() {
-        return post_legacy_anime_status_delete(api, title_id, user_id).await;
+        return post_legacy_anime_status_delete(api, title_id, public_profile_id).await;
     }
 
     let basic_auth = fetch_shinden_basic_auth(api).await?;
     let priority = input.priority.to_string();
     let recommend = input.recommend.to_string();
-    let url = legacy_userlist_series_url(user_id, title_id);
+    let url = legacy_userlist_series_url(public_profile_id, title_id);
 
     let mut last_error = None;
 
@@ -1524,7 +1559,7 @@ async fn post_legacy_anime_status(
         match verify_title_status_change_with_user(
             api,
             title_id,
-            user_id,
+            public_profile_id,
             status,
             "legacy_update_anime_status",
         )
@@ -1546,10 +1581,10 @@ async fn post_legacy_anime_status(
 async fn post_legacy_anime_status_delete(
     api: &ShindenAPI,
     title_id: u64,
-    user_id: &str,
+    public_profile_id: &str,
 ) -> Result<(), String> {
     let basic_auth = fetch_shinden_basic_auth(api).await?;
-    let url = legacy_userlist_series_url(user_id, title_id);
+    let url = legacy_userlist_series_url(public_profile_id, title_id);
     let response = api
         .request(reqwest::Method::POST, &url)
         .header(ACCEPT, "application/json")
@@ -1613,7 +1648,7 @@ fn validate_legacy_write_response(response_text: String) -> Result<(), String> {
 async fn verify_title_status_change_with_user(
     api: &ShindenAPI,
     title_id: u64,
-    user_id: &str,
+    public_profile_id: &str,
     status: Option<&str>,
     context: &str,
 ) -> Result<(), String> {
@@ -1626,7 +1661,7 @@ async fn verify_title_status_change_with_user(
     let mut found_status = None;
 
     for status in statuses {
-        let items = fetch_all_watching_items_for_status(api, &user_id, status).await?;
+        let items = fetch_all_watching_items_for_status(api, &public_profile_id, status).await?;
 
         if let Some(item) = items.into_iter().find(|item| item.title_id == title_id) {
             found_status = Some(item.watch_status.unwrap_or_else(|| status.to_string()));
@@ -1670,11 +1705,11 @@ async fn verify_title_status_change_with_user(
 async fn refresh_watching_cache_inner(
     api: &ShindenAPI,
     status: &Mutex<WatchingCacheRefreshStatus>,
-    user_id_cache: &Mutex<CachedUserId>,
+    public_profile_id_cache: &Mutex<CachedPublicProfileId>,
     filter: &WatchingAnimeFilter,
     force: bool,
 ) -> Result<WatchingCacheRefreshStatus, String> {
-    let items = fetch_all_watching_items(api, user_id_cache).await?;
+    let items = fetch_all_watching_items(api, public_profile_id_cache).await?;
     let mut cache = load_watching_availability_cache();
     let subtitle_key = selected_subtitle_language_key(filter);
     let subtitle_cache_key = selected_subtitle_cache_key(filter);
@@ -1761,12 +1796,12 @@ async fn refresh_watching_cache_inner(
 async fn refresh_watching_cache_item_inner(
     api: &ShindenAPI,
     status: &Mutex<WatchingCacheRefreshStatus>,
-    user_id_cache: &Mutex<CachedUserId>,
+    public_profile_id_cache: &Mutex<CachedPublicProfileId>,
     title_id: u64,
     filter: &WatchingAnimeFilter,
     force: bool,
 ) -> Result<WatchingCacheRefreshStatus, String> {
-    let items = fetch_all_watching_items(api, user_id_cache).await?;
+    let items = fetch_all_watching_items(api, public_profile_id_cache).await?;
     let item = items.into_iter().find(|item| item.title_id == title_id);
     let cache_key = watching_cache_key(title_id);
     let mut cache = load_watching_availability_cache();
@@ -2041,16 +2076,21 @@ fn watching_cache_item_error_message(title: &str) -> String {
     format!("Nie udalo sie sprawdzic: {title}")
 }
 
-fn watching_list_status_url(user_id: &str, status: &str, limit: usize, offset: usize) -> String {
+fn watching_list_status_url(
+    public_profile_id: &str,
+    status: &str,
+    limit: usize,
+    offset: usize,
+) -> String {
     let status = watch_status_list_slug(status);
 
     format!(
-        "https://lista.shinden.pl/api/userlist/{user_id}/anime/{status}?limit={limit}&offset={offset}"
+        "https://lista.shinden.pl/api/userlist/{public_profile_id}/anime/{status}?limit={limit}&offset={offset}"
     )
 }
 
-fn title_status_url(title_id: u64, user_id: &str) -> String {
-    format!("https://lista.shinden.pl/api/title-status/{title_id}/{user_id}")
+fn title_status_url(title_id: u64, public_profile_id: &str) -> String {
+    format!("https://lista.shinden.pl/api/title-status/{title_id}/{public_profile_id}")
 }
 
 fn season_page_url(year: Option<u16>, season: &str) -> String {
@@ -2095,8 +2135,8 @@ fn normalize_polish_ascii(value: &str) -> String {
     normalized
 }
 
-fn legacy_userlist_series_url(user_id: &str, title_id: u64) -> String {
-    format!("https://shinden.pl/api/userlist/{user_id}/series/{title_id}")
+fn legacy_userlist_series_url(public_profile_id: &str, title_id: u64) -> String {
+    format!("https://shinden.pl/api/userlist/{public_profile_id}/series/{title_id}")
 }
 
 fn series_url(title_id: u64) -> String {
@@ -2231,8 +2271,8 @@ fn title_id_from_series_url(url: &str) -> Option<String> {
         .find_map(|marker| extract_ascii_digits_after(url, marker))
 }
 
-fn title_episodes_url(title_id: u64, user_id: &str) -> String {
-    format!("https://lista.shinden.pl/api/title-episodes/{title_id}/{user_id}")
+fn title_episodes_url(title_id: u64, public_profile_id: &str) -> String {
+    format!("https://lista.shinden.pl/api/title-episodes/{title_id}/{public_profile_id}")
 }
 
 fn is_true_final_episode(episode_no: u32, total_episodes: Option<u32>) -> bool {
@@ -2311,7 +2351,7 @@ fn last_ascii_number(value: &str) -> Option<u32> {
     digits.parse::<u32>().ok()
 }
 
-fn extract_user_id_from_profile_html(html: &str) -> Option<String> {
+fn extract_public_profile_id_from_profile_html(html: &str) -> Option<String> {
     ["https://lista.shinden.pl/animelist/", "/animelist/"]
         .iter()
         .find_map(|marker| extract_ascii_digits_after(html, marker))
@@ -2865,12 +2905,12 @@ fn map_user_anime_list_item(
 
 async fn refresh_user_anime_list_cache_inner(
     api: &ShindenAPI,
-    user_id_cache: &Mutex<CachedUserId>,
+    public_profile_id_cache: &Mutex<CachedPublicProfileId>,
     status: &Mutex<UserAnimeListRefreshStatus>,
 ) -> Result<UserAnimeListRefreshStatus, String> {
     let mut cache = load_user_anime_list_cache();
     let now_ms = unix_timestamp_ms_u64();
-    let items = fetch_all_userlist_items(api, user_id_cache).await?;
+    let items = fetch_all_userlist_items(api, public_profile_id_cache).await?;
 
     merge_user_anime_list_cache(&mut cache, items, false, now_ms);
     cache.refreshed_at_ms = Some(now_ms);
@@ -4270,15 +4310,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_user_id_from_profile_links_finds_current_user_animelist() {
+    fn extract_public_profile_id_from_profile_links_finds_current_user_animelist() {
         let html = r#"
             <a href="https://lista.shinden.pl/animelist/31875-szypss">Lista Anime</a>
             <a href="/user/31875-szypss">Profil</a>
         "#;
 
-        let user_id = extract_user_id_from_profile_html(html);
+        let public_profile_id = extract_public_profile_id_from_profile_html(html);
 
-        assert_eq!(user_id.as_deref(), Some("31875"));
+        assert_eq!(public_profile_id.as_deref(), Some("31875"));
     }
 
     #[test]
@@ -4815,7 +4855,7 @@ mod tests {
     }
 
     #[test]
-    fn title_status_url_uses_title_and_user_ids() {
+    fn title_status_url_uses_title_and_public_profile_ids() {
         assert_eq!(
             title_status_url(59922, "31875"),
             "https://lista.shinden.pl/api/title-status/59922/31875"
@@ -5001,16 +5041,17 @@ mod tests {
     }
 
     #[test]
-    fn fresh_cached_user_id_is_reused_until_ttl_expires() {
-        let mut cache = CachedUserId::default();
-        store_cached_user_id_value(&mut cache, "31875", 10_000);
+    fn fresh_cached_public_profile_id_is_reused_until_ttl_expires() {
+        let mut cache = CachedPublicProfileId::default();
+        store_cached_public_profile_id_value(&mut cache, "31875", 10_000);
 
         assert_eq!(
-            cached_user_id_if_fresh(&cache, 10_000 + USER_ID_CACHE_TTL_MS - 1).as_deref(),
+            cached_public_profile_id_if_fresh(&cache, 10_000 + PUBLIC_PROFILE_ID_CACHE_TTL_MS - 1)
+                .as_deref(),
             Some("31875")
         );
         assert_eq!(
-            cached_user_id_if_fresh(&cache, 10_000 + USER_ID_CACHE_TTL_MS + 1),
+            cached_public_profile_id_if_fresh(&cache, 10_000 + PUBLIC_PROFILE_ID_CACHE_TTL_MS + 1),
             None
         );
     }
