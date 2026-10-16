@@ -495,13 +495,17 @@ impl ShindenClientBackend {
     }
 
     pub async fn test_connection(&self) -> Result<(), String> {
-        match self.api.get_html("http://shinden.pl").await {
+        match self.api.get_html("https://shinden.pl/").await {
             Ok(_) => Ok(()),
             Err(e) => Err(command_error(
                 "test_connection",
                 format!("Connection failed: {}", e),
             )),
         }
+    }
+
+    pub async fn get_image(&self, url: &str) -> Result<crate::images::ShindenImage, String> {
+        self.api.get_image(url).await.map_err(|error| error.to_string())
     }
 
     pub async fn search(&self, query: String) -> Result<Vec<SearchAnime>, String> {
@@ -1100,6 +1104,12 @@ impl ShindenClientBackend {
         }
     }
 
+    pub fn import_browser_clearance(&self, user_agent: &str, cookie: &str) -> Result<(), String> {
+        self.api
+            .import_browser_clearance(user_agent, cookie)
+            .map_err(|error| command_error("browser clearance", error))
+    }
+
     pub async fn login(&self, username: String, password: String) -> Result<(), String> {
         let result = self
             .api
@@ -1318,13 +1328,12 @@ async fn fetch_watching_list_status_page(
 ) -> Result<WatchingListApiResult, String> {
     let url = watching_list_status_url(user_id, status, limit, offset);
     let response = api
-        .client
-        .get(&url)
+        .request(reqwest::Method::GET, &url)
         .header(ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| command_error("get_watching_anime request", e))?
-        .error_for_status()
+        .map_err(|e| command_error("get_watching_anime request", e))?;
+    let response = crate::client::check_response(response)
         .map_err(|e| command_error("get_watching_anime response", e))?;
     let payload = response
         .json::<WatchingListApiResponse>()
@@ -1347,13 +1356,12 @@ async fn fetch_title_status(
     user_id: &str,
 ) -> Result<Option<TitleStatusApiTitle>, String> {
     let response = api
-        .client
-        .get(title_status_url(title_id, user_id))
+        .request(reqwest::Method::GET, title_status_url(title_id, user_id))
         .header(ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| command_error("title_status request", e))?
-        .error_for_status()
+        .map_err(|e| command_error("title_status request", e))?;
+    let response = crate::client::check_response(response)
         .map_err(|e| command_error("title_status response", e))?;
 
     let payload = response
@@ -1401,13 +1409,12 @@ async fn fetch_title_episode_progress(
     user_id: &str,
 ) -> Result<Vec<TitleEpisodeApiItem>, String> {
     let response = api
-        .client
-        .get(title_episodes_url(title_id, user_id))
+        .request(reqwest::Method::GET, title_episodes_url(title_id, user_id))
         .header(ACCEPT, "application/json")
         .send()
         .await
-        .map_err(|e| command_error("title_episodes request", e))?
-        .error_for_status()
+        .map_err(|e| command_error("title_episodes request", e))?;
+    let response = crate::client::check_response(response)
         .map_err(|e| command_error("title_episodes response", e))?;
 
     let payload = response
@@ -1437,8 +1444,7 @@ async fn post_shinden_json<T: Serialize>(
     let response_context = format!("{context} response");
     let json_context = format!("{context} json");
     let response = api
-        .client
-        .post(url)
+        .request(reqwest::Method::POST, url)
         .header(ACCEPT, "application/json")
         .header(CONTENT_TYPE, "application/json")
         .header(ORIGIN, "https://lista.shinden.pl")
@@ -1446,8 +1452,8 @@ async fn post_shinden_json<T: Serialize>(
         .json(payload)
         .send()
         .await
-        .map_err(|e| command_error(&request_context, e))?
-        .error_for_status()
+        .map_err(|e| command_error(&request_context, e))?;
+    let response = crate::client::check_response(response)
         .map_err(|e| command_error(&response_context, e))?;
 
     let payload = response
@@ -1488,8 +1494,7 @@ async fn post_legacy_anime_status(
 
     for legacy_status in legacy_statuses {
         let response = api
-            .client
-            .post(&url)
+            .request(reqwest::Method::POST, &url)
             .header(ACCEPT, "application/json")
             .header("X-Requested-With", "XMLHttpRequest")
             .header(ORIGIN, "https://shinden.pl")
@@ -1502,8 +1507,8 @@ async fn post_legacy_anime_status(
             ])
             .send()
             .await
-            .map_err(|e| command_error("legacy_update_anime_status request", e))?
-            .error_for_status()
+            .map_err(|e| command_error("legacy_update_anime_status request", e))?;
+        let response = crate::client::check_response(response)
             .map_err(|e| command_error("legacy_update_anime_status response", e))?;
 
         if let Err(error) = validate_legacy_write_response(
@@ -1546,8 +1551,7 @@ async fn post_legacy_anime_status_delete(
     let basic_auth = fetch_shinden_basic_auth(api).await?;
     let url = legacy_userlist_series_url(user_id, title_id);
     let response = api
-        .client
-        .post(&url)
+        .request(reqwest::Method::POST, &url)
         .header(ACCEPT, "application/json")
         .header(CONTENT_TYPE, "application/json")
         .header("X-HTTP-Method-Override", "DELETE")
@@ -1557,8 +1561,8 @@ async fn post_legacy_anime_status_delete(
         .json(&serde_json::json!({ "auth": basic_auth }))
         .send()
         .await
-        .map_err(|e| command_error("legacy_delete_anime_status request", e))?
-        .error_for_status()
+        .map_err(|e| command_error("legacy_delete_anime_status request", e))?;
+    let response = crate::client::check_response(response)
         .map_err(|e| command_error("legacy_delete_anime_status response", e))?;
 
     validate_legacy_write_response(
