@@ -199,18 +199,38 @@ impl ShindenAPI {
     }
 
     pub async fn get_html(&self, url: &str) -> Result<String> {
+        let response = self.frontend_response(url).await?;
+        let body = response.text().await?;
+        save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        Ok(body)
+    }
+
+    async fn frontend_response(&self, url: &str) -> Result<Response> {
         let headers = self.headers(RequestType::Frontend, url)?;
         let response = self
             .request(Method::GET, url)
             .headers(headers)
             .send()
             .await?;
-        let response = check_response(response)?;
-
-        let body = response.text().await?;
-
-        save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
-        Ok(body)
+        match check_response(response) {
+            Err(error)
+                if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                    error.status() == Some(reqwest::StatusCode::NOT_FOUND)
+                }) =>
+            {
+                let Some(alternate) = alternate_title_url(url) else {
+                    return Err(error);
+                };
+                let headers = self.headers(RequestType::Frontend, &alternate)?;
+                check_response(
+                    self.request(Method::GET, &alternate)
+                        .headers(headers)
+                        .send()
+                        .await?,
+                )
+            }
+            result => result,
+        }
     }
 
     pub(crate) async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
@@ -226,13 +246,7 @@ impl ShindenAPI {
         Ok(body)
     }
     pub async fn resolve_final_url(&self, url: &str) -> Result<String> {
-        let headers = self.headers(RequestType::Frontend, url)?;
-        let response = self
-            .request(Method::GET, url)
-            .headers(headers)
-            .send()
-            .await?;
-        let response = check_response(response)?;
+        let response = self.frontend_response(url).await?;
 
         let resolved_url = response.url().to_string();
         save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
@@ -265,6 +279,32 @@ impl ShindenAPI {
     }
 }
 
+fn alternate_title_url(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value).ok()?;
+    let (prefix, suffix) = url
+        .path()
+        .strip_prefix("/series/")
+        .map(|path| ("/titles/", path))
+        .or_else(|| {
+            url.path()
+                .strip_prefix("/titles/")
+                .map(|path| ("/series/", path))
+        })?;
+    let id = suffix
+        .split('/')
+        .next()?
+        .split('-')
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    if id == 0 {
+        return None;
+    }
+    let path = format!("{prefix}{suffix}");
+    url.set_path(&path);
+    Some(url.to_string())
+}
+
 fn load_cookies(path: &std::path::Path) -> Result<CookieStore> {
     if path.exists() {
         let file = File::open(path)?;
@@ -287,6 +327,52 @@ fn save_cookies(store: &CookieStore, path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_series_route_resolves_to_titles_before_loading_episodes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/series/50472", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (path, status, body) in [
+                ("/series/50472", "404 Not Found", "Missing"),
+                ("/titles/50472", "200 OK", "Title page"),
+                (
+                    "/titles/50472/episodes",
+                    "200 OK",
+                    r#"<section id="odcinki"><ol class="ep-rows"><li class="ep-row"><a class="ep-row__link" href="/epek/50472-devilman-crybaby/view/160715"><span class="ep-row__no">1</span></a></li></ol></section>"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 8192];
+                let size = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..size]).starts_with(&format!("GET {path} "))
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let storage = TestStorage::new();
+        let api = storage.api();
+        let episodes = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(api.get_episodes(&url))
+            .unwrap();
+        assert_eq!(
+            episodes[0].link,
+            "https://shinden.pl/epek/50472-devilman-crybaby/view/160715"
+        );
+    }
 
     #[test]
     fn browser_login_imports_first_party_session_and_rejects_other_domains_atomically() {
@@ -366,7 +452,7 @@ mod tests {
             "http://{}/series/71632-kokoore",
             listener.local_addr().unwrap()
         );
-        let responses = vec![
+        let mut responses = vec![
             (
                 "/series/71632-kokoore/episodes",
                 first_status.to_string(),
@@ -378,6 +464,16 @@ mod tests {
                 episode_body.to_string(),
             ),
         ];
+        if first_status == "404 Not Found" {
+            responses.insert(
+                1,
+                (
+                    "/titles/71632-kokoore/episodes",
+                    "404 Not Found".to_string(),
+                    "Missing".to_string(),
+                ),
+            );
+        }
         std::thread::spawn(move || {
             for (path, status, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();

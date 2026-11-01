@@ -442,9 +442,10 @@ fn absolute_shinden_url(url: &str) -> String {
 }
 
 fn title_id_from_url(url: &str) -> Option<u64> {
-    let marker = "/series/";
-    let start = url.find(marker)? + marker.len();
-    let id = url[start..]
+    let path = ["/series/", "/titles/"]
+        .iter()
+        .find_map(|marker| url.split_once(marker).map(|(_, path)| path))?;
+    let id = path
         .chars()
         .take_while(|character| character.is_ascii_digit())
         .collect::<String>();
@@ -454,6 +455,18 @@ fn title_id_from_url(url: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_ids_are_kept_for_titles_routes() {
+        assert_eq!(
+            parse_anime_details_html(
+                "<html></html>",
+                "https://shinden.pl/titles/50472-devilman-crybaby"
+            )
+            .title_id,
+            Some(50472)
+        );
+    }
 
     #[test]
     fn parses_redesigned_title_header_cover_and_ratings() {

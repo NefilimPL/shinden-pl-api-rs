@@ -114,7 +114,9 @@ fn episode_link(href: &str) -> Option<String> {
         .ok()?;
     (url.scheme() == "https"
         && url.host_str() == Some("shinden.pl")
-        && url.path().starts_with("/episode/"))
+        && ["/episode/", "/epek/"]
+            .iter()
+            .any(|prefix| url.path().starts_with(prefix)))
     .then(|| url.to_string())
 }
 
@@ -165,6 +167,15 @@ mod tests {
             "https://shinden.pl/episode/73355-tempal-item-no-chikara/view/272100"
         );
         assert!(parse_episode_table(r#"<section class="episode-list ep-list" id="odcinki"><ol class="ep-rows"></ol></section>"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn epek_links_are_playable_episode_links() {
+        let episodes = parse_episode_table(r#"<section id="odcinki"><ol class="ep-rows"><li class="ep-row"><a class="ep-row__link" href="/epek/50472-devilman-crybaby/view/160715"><span class="ep-row__no">1</span><span class="ep-row__title">Named episode</span></a></li></ol></section>"#).unwrap();
+        assert_eq!(
+            episodes[0].link,
+            "https://shinden.pl/epek/50472-devilman-crybaby/view/160715"
+        );
     }
 
     #[test]

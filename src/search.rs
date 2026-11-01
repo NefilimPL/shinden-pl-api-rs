@@ -117,6 +117,25 @@ fn page_number_from_href(href: &str) -> Option<u32> {
 fn parse_search_results_html(html: &str) -> Vec<Anime> {
 
         let doc = Html::parse_document(html);
+        let modern = Selector::parse("li.sh-tagi-wynik").unwrap();
+        let modern_results: Vec<_> = doc.select(&modern).filter_map(|row| {
+            let text = |selector: &str| row.select(&Selector::parse(selector).unwrap()).next()
+                .map(|node| node.text().collect::<String>().trim().to_string()).unwrap_or_default();
+            let name = text(".sh-tagi-nazwa");
+            if name.is_empty() { return None; }
+            let base = Url::parse("https://shinden.pl/").unwrap();
+            let link = row.select(&Selector::parse("a[href]").unwrap()).next()?;
+            let url = base.join(link.value().attr("href")?).ok()?.to_string();
+            let image_url = row.select(&Selector::parse("img:not(.sh-okl-tlo)").unwrap()).next()
+                .and_then(|node| node.value().attr("src")).and_then(|src| base.join(src).ok())
+                .map(|url| url.to_string()).unwrap_or_default();
+            let rating = row.select(&Selector::parse(".sh-tagi-meta b").unwrap()).next()
+                .and_then(|node| node.text().map(str::trim).filter(|text| !text.is_empty()).last())
+                .unwrap_or_default().to_string();
+            Some(Anime { name, url, image_url, anime_type: text(".sh-tagi-typ"), rating,
+                episodes: String::new(), description: String::new() })
+        }).collect();
+        if !modern_results.is_empty() { return modern_results; }
         let div_row = Selector::parse(".div-row").unwrap();
         let h3 = Selector::parse("h3").unwrap();
         let a = Selector::parse("a").unwrap();
@@ -300,6 +319,15 @@ mod tests {
         assert_eq!(page.total_pages, 8);
         assert_eq!(page.items.len(), 1);
     }
+    #[test]
+    fn modern_search_results_preserve_titles_routes_and_metadata() {
+        let results = parse_search_results_html(r#"<ol class="sh-tagi-wyniki"><li class="sh-tagi-wynik"><a href="/titles/50472-devilman-crybaby"><span class="sh-okl"><img src="/res/images/280x400/206796.webp"></span><span class="sh-tagi-nazwa">Devilman: Crybaby</span><span class="sh-tagi-meta"><span class="sh-tagi-typ">ONA</span><b><span class="sh-tagi-ukryte">Ocena</span>7,19</b></span></a></li></ol>"#);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://shinden.pl/titles/50472-devilman-crybaby");
+        assert_eq!(results[0].name, "Devilman: Crybaby");
+        assert_eq!(results[0].anime_type, "ONA");
+        assert_eq!(results[0].rating, "7,19");
+        assert_eq!(results[0].image_url, "https://shinden.pl/res/images/280x400/206796.webp");
+    }
+
 }
-
-
