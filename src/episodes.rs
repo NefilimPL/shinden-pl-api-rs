@@ -36,6 +36,39 @@ impl ShindenAPI {
 fn parse_episode_table(html: &str) -> Option<Vec<Episode>> {
     let doc = Html::parse_document(&html);
 
+    if let Some(list) = doc
+        .select(&Selector::parse("#odcinki .ep-rows").unwrap())
+        .next()
+    {
+        let mut rows = Vec::new();
+        for row in list.select(&Selector::parse(".ep-row").unwrap()) {
+            let number = row
+                .select(&Selector::parse(".ep-row__no").unwrap())
+                .next()
+                .map(|node| node.text().collect::<String>().trim().to_string())
+                .unwrap_or_default();
+            let name = row
+                .select(&Selector::parse(".ep-row__title").unwrap())
+                .next()
+                .map(|node| node.text().collect::<String>().trim().to_string())
+                .unwrap_or_default();
+            let title = if name.is_empty() {
+                format!("Odcinek {number}")
+            } else {
+                format!("Odcinek {number}: {name}")
+            };
+            let link = row
+                .select(&Selector::parse("a.ep-row__link[href]").unwrap())
+                .next()
+                .and_then(|node| node.value().attr("href"))
+                .and_then(episode_link)
+                .unwrap_or_default();
+            rows.push(Episode { title, link });
+        }
+        rows.reverse();
+        return Some(rows);
+    }
+
     let tbody_selector = Selector::parse("tbody.list-episode-checkboxes").unwrap();
     let tbody_element = doc.select(&tbody_selector).next()?;
 
@@ -74,6 +107,17 @@ fn parse_episode_table(html: &str) -> Option<Vec<Episode>> {
     Some(episodes)
 }
 
+fn episode_link(href: &str) -> Option<String> {
+    let url = reqwest::Url::parse("https://shinden.pl/")
+        .ok()?
+        .join(href.trim())
+        .ok()?;
+    (url.scheme() == "https"
+        && url.host_str() == Some("shinden.pl")
+        && url.path().starts_with("/episode/"))
+    .then(|| url.to_string())
+}
+
 fn episode_page_url(series_url: &str) -> String {
     let without_fragment = series_url.split('#').next().unwrap_or(series_url);
     let base = without_fragment
@@ -105,6 +149,23 @@ fn requires_series_url_resolution(link: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_current_shinden_episode_rows_with_explicit_numbers() {
+        let html = r#"<section class="episode-list ep-list" id="odcinki"><ol class="ep-rows">
+          <li class="ep-row"><a class="ep-row__link" href="/episode/73355-tempal-item-no-chikara/view/272113"><span class="ep-row__no">2</span><span class="ep-row__title">Named episode</span></a></li>
+          <li class="ep-row"><a class="ep-row__link" href="/episode/73355-tempal-item-no-chikara/view/272100"><span class="ep-row__no">1</span><span class="ep-row__title"></span></a></li>
+        </ol></section>"#;
+        let episodes = parse_episode_table(html).unwrap();
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(episodes[0].title, "Odcinek 1");
+        assert_eq!(episodes[1].title, "Odcinek 2: Named episode");
+        assert_eq!(
+            episodes[0].link,
+            "https://shinden.pl/episode/73355-tempal-item-no-chikara/view/272100"
+        );
+        assert!(parse_episode_table(r#"<section class="episode-list ep-list" id="odcinki"><ol class="ep-rows"></ol></section>"#).unwrap().is_empty());
+    }
 
     #[test]
     fn builds_current_episode_page_url_from_canonical_series_url() {

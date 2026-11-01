@@ -60,6 +60,8 @@ impl ShindenAPI {
 
         let client = Client::builder()
             .cookie_provider(jar.clone())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::default())
             .gzip(true)
             .deflate(true)
@@ -122,24 +124,64 @@ impl ShindenAPI {
     /// Import only clearance, leaving the application's login session untouched.
     /// The host application obtains this cookie from its own trusted browser window.
     pub fn import_browser_clearance(&self, user_agent: &str, cookie: &str) -> Result<()> {
+        let parsed = cookie_store::RawCookie::parse(cookie.to_owned())
+            .context("Invalid clearance cookie")?;
+        anyhow::ensure!(
+            parsed.name() == "cf_clearance" && !parsed.value().is_empty(),
+            "Missing Cloudflare clearance"
+        );
+        self.import_browser_cookies(user_agent, &[cookie.to_string()], false)
+    }
+
+    pub fn import_browser_session(&self, user_agent: &str, cookies: &[String]) -> Result<()> {
+        anyhow::ensure!(
+            cookies
+                .iter()
+                .any(|raw| cookie_store::RawCookie::parse(raw.to_owned())
+                    .ok()
+                    .is_some_and(
+                        |cookie| (matches!(cookie.name(), "sessionlogin" | "autologin")
+                            && !cookie.value().is_empty())
+                            || (cookie.name() == "sh_logged"
+                                && !matches!(cookie.value(), "" | "0" | "false"))
+                    )),
+            "Zaloguj się w oknie Shinden przed potwierdzeniem logowania."
+        );
+        self.import_browser_cookies(user_agent, cookies, true)
+    }
+
+    fn import_browser_cookies(
+        &self,
+        user_agent: &str,
+        cookies: &[String],
+        replace_session: bool,
+    ) -> Result<()> {
         anyhow::ensure!(!user_agent.trim().is_empty(), "Missing browser user agent");
         let user_agent_header =
             HeaderValue::from_str(user_agent).context("Invalid browser user agent")?;
-        let cookie = cookie_store::RawCookie::parse(cookie.to_owned())
-            .context("Invalid clearance cookie")?;
-        anyhow::ensure!(
-            cookie.name() == "cf_clearance" && !cookie.value().is_empty(),
-            "Missing Cloudflare clearance"
-        );
         let url = reqwest::Url::parse("https://shinden.pl/")?;
         let mut store = self
             .jar
             .lock()
             .map_err(|_| anyhow::anyhow!("Cookie store unavailable"))?;
-        let mut updated = store.clone();
-        updated
-            .insert_raw(&cookie, &url)
-            .map_err(|_| anyhow::anyhow!("Invalid or expired Shinden clearance cookie"))?;
+        let mut updated = if replace_session {
+            CookieStore::default()
+        } else {
+            store.clone()
+        };
+        for raw in cookies {
+            let cookie = cookie_store::RawCookie::parse(raw.to_owned())
+                .context("Invalid Shinden session cookie")?;
+            anyhow::ensure!(
+                cookie
+                    .domain()
+                    .is_none_or(|domain| domain.trim_start_matches('.') == "shinden.pl"),
+                "Unsupported Shinden session cookie domain"
+            );
+            updated
+                .insert_raw(&cookie, &url)
+                .map_err(|_| anyhow::anyhow!("Invalid or expired Shinden cookie"))?;
+        }
         let mut agent = self
             .browser_user_agent
             .write()
@@ -167,6 +209,19 @@ impl ShindenAPI {
 
         let body = response.text().await?;
 
+        save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        Ok(body)
+    }
+
+    pub(crate) async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
+        let headers = self.headers(RequestType::Api, url)?;
+        let response = self
+            .request(Method::GET, url)
+            .headers(headers)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .send()
+            .await?;
+        let body = check_response(response)?.json().await?;
         save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
         Ok(body)
     }
@@ -232,6 +287,77 @@ fn save_cookies(store: &CookieStore, path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_login_imports_first_party_session_and_rejects_other_domains_atomically() {
+        let storage = TestStorage::new();
+        let api = storage.api();
+        assert!(
+            api.import_browser_session(
+                "Browser/123",
+                &[
+                    "sessionlogin=active; Path=/; Secure; Max-Age=3600".into(),
+                    "other=bad; Domain=example.com".into()
+                ]
+            )
+            .is_err()
+        );
+        assert!(!storage.0.join("cookies.json").exists());
+        assert!(
+            api.import_browser_session(
+                "Browser/123",
+                &["cf_clearance=clear; Path=/; Secure; Max-Age=3600".into()]
+            )
+            .is_err()
+        );
+        api.import_browser_session(
+            "Browser/123",
+            &[
+                "sessionlogin=active; Path=/; Secure; HttpOnly; Max-Age=3600".into(),
+                "sh_logged=1; Path=/; Secure; Max-Age=3600".into(),
+            ],
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("https://shinden.pl/").unwrap();
+        assert!(
+            api.jar
+                .lock()
+                .unwrap()
+                .get_request_values(&url)
+                .any(|(name, value)| name == "sessionlogin" && value == "active")
+        );
+    }
+
+    #[test]
+    fn browser_login_cannot_reuse_a_previous_accounts_absent_cookies() {
+        let storage = TestStorage::new();
+        let api = storage.api();
+        api.import_browser_session(
+            "Browser/123",
+            &["sessionlogin=previous; Path=/; Secure; Max-Age=3600".into()],
+        )
+        .unwrap();
+        assert!(
+            api.import_browser_session(
+                "Browser/123",
+                &["sh_logged=0; Path=/; Secure; Max-Age=3600".into()]
+            )
+            .is_err()
+        );
+        api.import_browser_session(
+            "Browser/123",
+            &["sh_logged=1; Path=/; Secure; Max-Age=3600".into()],
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("https://shinden.pl/").unwrap();
+        assert!(
+            !api.jar
+                .lock()
+                .unwrap()
+                .get_request_values(&url)
+                .any(|(name, _)| name == "sessionlogin")
+        );
+    }
 
     fn episode_server(first_status: &str, first_body: &str, episode_body: &str) -> String {
         use std::io::{Read, Write};

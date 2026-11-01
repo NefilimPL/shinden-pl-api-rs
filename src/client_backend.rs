@@ -1122,6 +1122,12 @@ impl ShindenClientBackend {
             .map_err(|error| command_error("browser clearance", error))
     }
 
+    pub fn import_browser_session(&self, user_agent: &str, cookies: &[String]) -> Result<(), String> {
+        self.api.import_browser_session(user_agent, cookies)
+            .map_err(|error| command_error("browser login", error))?;
+        clear_cached_public_profile_id(&self.public_profile_id_cache)
+    }
+
     pub async fn login(&self, username: String, password: String) -> Result<(), String> {
         let result = self
             .api
@@ -1241,12 +1247,12 @@ async fn fetch_current_public_profile_id(
     context: &str,
 ) -> Result<String, String> {
     let profile_context = format!("{context} profile");
-    let profile_html = api
-        .get_html("https://shinden.pl/user")
+    let user = api
+        .get_current_user()
         .await
         .map_err(|e| command_error(&profile_context, e))?;
 
-    extract_public_profile_id_from_profile_html(&profile_html)
+    user.map(|user| user.id.to_string())
         .ok_or_else(|| command_error(&profile_context, "User is not logged in"))
 }
 
@@ -1340,7 +1346,7 @@ fn lock_public_profile_id_cache(
 
 async fn fetch_shinden_basic_auth(api: &ShindenAPI) -> Result<String, String> {
     let profile_html = api
-        .get_html("https://shinden.pl/user")
+        .get_html("https://shinden.pl/")
         .await
         .map_err(|e| command_error("legacy auth profile", e))?;
 
@@ -2322,41 +2328,8 @@ fn merge_episode_progress(
 
 fn episode_number_from_playback_title(title: &str) -> Option<u32> {
     let normalized = title.trim().to_ascii_lowercase();
-    if !(normalized.starts_with("episode ") || normalized.starts_with("odcinek ")) {
-        return None;
-    }
-
-    last_ascii_number(title)
-}
-
-fn last_ascii_number(value: &str) -> Option<u32> {
-    let mut digits_reversed = String::new();
-    let mut found_digit = false;
-
-    for character in value.chars().rev() {
-        if character.is_ascii_digit() {
-            found_digit = true;
-            digits_reversed.push(character);
-            continue;
-        }
-
-        if found_digit {
-            break;
-        }
-    }
-
-    if digits_reversed.is_empty() {
-        return None;
-    }
-
-    let digits: String = digits_reversed.chars().rev().collect();
-    digits.parse::<u32>().ok()
-}
-
-fn extract_public_profile_id_from_profile_html(html: &str) -> Option<String> {
-    ["https://lista.shinden.pl/animelist/", "/animelist/"]
-        .iter()
-        .find_map(|marker| extract_ascii_digits_after(html, marker))
+    let suffix = normalized.strip_prefix("episode ").or_else(|| normalized.strip_prefix("odcinek "))?;
+    suffix.chars().take_while(|character| character.is_ascii_digit()).collect::<String>().parse().ok()
 }
 
 fn extract_shinden_basic_auth(html: &str) -> Option<String> {
@@ -4312,18 +4285,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_public_profile_id_from_profile_links_finds_current_user_animelist() {
-        let html = r#"
-            <a href="https://lista.shinden.pl/animelist/31875-szypss">Lista Anime</a>
-            <a href="/user/31875-szypss">Profil</a>
-        "#;
-
-        let public_profile_id = extract_public_profile_id_from_profile_html(html);
-
-        assert_eq!(public_profile_id.as_deref(), Some("31875"));
-    }
-
-    #[test]
     fn extract_shinden_basic_auth_reads_storage_token() {
         let html = r#"<script>_Storage.basic = "token-123";</script>"#;
 
@@ -4901,6 +4862,12 @@ mod tests {
             title_url_from_search_results_or_id(45666, &results),
             "https://shinden.pl/series/45666-matched-title"
         );
+    }
+
+    #[test]
+    fn episode_numbers_do_not_come_from_digits_in_the_name() {
+        assert_eq!(episode_number_from_playback_title("Odcinek 1: Part 2"), Some(1));
+        assert_eq!(episode_number_from_playback_title("Episode 25: 2026"), Some(25));
     }
     #[test]
     fn cached_canonical_url_is_used_without_a_new_title_search() {
