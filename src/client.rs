@@ -233,6 +233,131 @@ fn save_cookies(store: &CookieStore, path: &std::path::Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn episode_server(first_status: &str, first_body: &str, episode_body: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/series/71632-kokoore",
+            listener.local_addr().unwrap()
+        );
+        let responses = vec![
+            (
+                "/series/71632-kokoore/episodes",
+                first_status.to_string(),
+                first_body.to_string(),
+            ),
+            (
+                "/series/71632-kokoore/all-episodes",
+                "200 OK".to_string(),
+                episode_body.to_string(),
+            ),
+        ];
+        std::thread::spawn(move || {
+            for (path, status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 8192];
+                let size = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..size]).starts_with(&format!("GET {path} "))
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        url
+    }
+
+    fn load_test_episodes(
+        first_status: &str,
+        first_body: &str,
+        body: &str,
+    ) -> Result<Vec<crate::models::Episode>> {
+        let storage = TestStorage::new();
+        let api = storage.api();
+        let url = episode_server(first_status, first_body, body);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(api.get_episodes(&url))
+    }
+
+    #[test]
+    fn episodes_recover_using_all_episodes_when_current_route_has_no_table() {
+        let body = r#"<table><tbody class="list-episode-checkboxes">
+            <tr><td class="ep-title">Odcinek 1</td><td><a class="button active" href="/episode/1">Play</a></td></tr>
+        </tbody></table>"#;
+        for status in ["200 OK", "404 Not Found"] {
+            let episodes =
+                load_test_episodes(status, "<html>Missing episode page</html>", body).unwrap();
+            assert_eq!(episodes.len(), 1);
+            assert_eq!(episodes[0].link, "https://shinden.pl/episode/1");
+        }
+    }
+
+    #[test]
+    fn unavailable_episode_rows_keep_their_positions_and_playback_links() {
+        let episodes = load_test_episodes(
+            "200 OK",
+            r#"<table><tbody class="list-episode-checkboxes">
+            <tr><td class="ep-title">Third title</td><td><a class="button active" href="https://shinden.pl/episode/3">Play</a></td></tr>
+            <tr><td class="ep-title">Second title</td><td><a class="button disabled">Play</a></td></tr>
+            <tr><td class="ep-title">First title</td><td><a class="button active" href="/episode/1">Play</a></td></tr>
+        </tbody></table>"#,
+            "",
+        ).unwrap();
+        assert_eq!(episodes.len(), 3);
+        assert_eq!(episodes[0].title, "First title");
+        assert_eq!(episodes[0].link, "https://shinden.pl/episode/1");
+        assert_eq!(episodes[1].title, "Second title");
+        assert_eq!(episodes[1].link, "");
+        assert_eq!(episodes[2].title, "Third title");
+        assert_eq!(episodes[2].link, "https://shinden.pl/episode/3");
+    }
+
+    #[test]
+    fn an_empty_episode_table_is_a_successful_pre_premiere_snapshot() {
+        let episodes = load_test_episodes(
+            "200 OK",
+            r#"<table><tbody class="list-episode-checkboxes"></tbody></table>"#,
+            "",
+        )
+        .unwrap();
+        assert!(episodes.is_empty());
+    }
+
+    #[test]
+    fn episode_fallback_preserves_access_denials_and_browser_verification() {
+        let body = r#"<table><tbody class="list-episode-checkboxes"></tbody></table>"#;
+        let error = load_test_episodes("403 Forbidden", "Forbidden", body)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("403"), "{error}");
+        let error = load_test_episodes("200 OK\r\ncf-mitigated: challenge", "Challenge", body)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(BROWSER_VERIFICATION_REQUIRED), "{error}");
+    }
+
+    #[test]
+    fn missing_episode_tables_are_errors_instead_of_empty_premiere_snapshots() {
+        let error = load_test_episodes(
+            "200 OK",
+            "<html>Not episodes</html>",
+            "<html>Not episodes either</html>",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Could not find episode table"), "{error}");
+    }
+
     struct TestStorage(PathBuf);
 
     impl TestStorage {

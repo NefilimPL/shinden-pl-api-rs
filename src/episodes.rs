@@ -11,38 +11,67 @@ impl ShindenAPI {
             link.trim().to_string()
         };
         let url = episode_page_url(&series_url);
-
-        let html = self.get_html(&url).await?;
-        let doc = Html::parse_document(&html);
-
-        let tbody_selector = Selector::parse("tbody.list-episode-checkboxes").unwrap();
-        let tbody_element = doc.select(&tbody_selector)
-            .next()
-            .context("Could not find tbody element on the page")?;
-
-        let title_selector = Selector::parse(".ep-title").unwrap();
-        let button_selector = Selector::parse("a.button.active").unwrap();
-
-        let mut episodes = Vec::new();
-
-        for el in tbody_element.select(&title_selector) {
-            episodes.push(Episode {
-                title: el.text().collect::<String>(),
-                link: String::new(),
-            });
-        }
-
-        for (i, el) in tbody_element.select(&button_selector).enumerate() {
-            if let Some(href) = el.value().attr("href") {
-                if let Some(ep) = episodes.get_mut(i) {
-                    ep.link = format!("https://shinden.pl{}", href);
+        match self.get_html(&url).await {
+            Ok(html) => {
+                if let Some(episodes) = parse_episode_table(&html) {
+                    return Ok(episodes);
                 }
             }
+            Err(error)
+                if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                    error.status() == Some(reqwest::StatusCode::NOT_FOUND)
+                }) => {}
+            Err(error) => return Err(error),
         }
 
-        episodes.reverse();
-        Ok(episodes)
+        // Shinden has used both routes. A missing table is not an empty list:
+        // it may be the title page returned for an unsupported episode route.
+        let legacy_url = url.trim_end_matches("/episodes").to_string() + "/all-episodes";
+        let html = self.get_html(&legacy_url).await?;
+        parse_episode_table(&html)
+            .with_context(|| format!("Could not find episode table on {url} or {legacy_url}"))
     }
+}
+
+fn parse_episode_table(html: &str) -> Option<Vec<Episode>> {
+    let doc = Html::parse_document(&html);
+
+    let tbody_selector = Selector::parse("tbody.list-episode-checkboxes").unwrap();
+    let tbody_element = doc.select(&tbody_selector).next()?;
+
+    let row_selector = Selector::parse("tr").unwrap();
+    let title_selector = Selector::parse(".ep-title").unwrap();
+    let button_selector = Selector::parse("a.button.active").unwrap();
+
+    let mut episodes = Vec::new();
+
+    for row in tbody_element.select(&row_selector) {
+        let Some(title) = row.select(&title_selector).next() else {
+            continue;
+        };
+        let link = row
+            .select(&button_selector)
+            .next()
+            .and_then(|button| button.value().attr("href"))
+            .map(str::trim)
+            .filter(|href| !href.is_empty())
+            .and_then(|href| {
+                reqwest::Url::parse("https://shinden.pl/")
+                    .unwrap()
+                    .join(href)
+                    .ok()
+            })
+            .filter(|link| link.scheme() == "https" && link.host_str() == Some("shinden.pl"))
+            .map(|link| link.to_string())
+            .unwrap_or_default();
+        episodes.push(Episode {
+            title: title.text().collect::<String>().trim().to_string(),
+            link,
+        });
+    }
+
+    episodes.reverse();
+    Some(episodes)
 }
 
 fn episode_page_url(series_url: &str) -> String {
@@ -51,7 +80,9 @@ fn episode_page_url(series_url: &str) -> String {
         .split('?')
         .next()
         .unwrap_or(without_fragment)
-        .trim_end_matches('/');
+        .trim_end_matches('/')
+        .trim_end_matches("/all-episodes")
+        .trim_end_matches("/episodes");
     format!("{base}/episodes")
 }
 
@@ -62,7 +93,13 @@ fn requires_series_url_resolution(link: &str) -> bool {
     let Some((_, path)) = path else {
         return false;
     };
-    let segment = path.split('/').next().unwrap_or_default().split('?').next().unwrap_or_default();
+    let segment = path
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .split('?')
+        .next()
+        .unwrap_or_default();
     !segment.is_empty() && segment.chars().all(|character| character.is_ascii_digit())
 }
 #[cfg(test)]
@@ -78,9 +115,28 @@ mod tests {
     }
 
     #[test]
+    fn episode_page_urls_do_not_duplicate_an_existing_episode_suffix() {
+        for url in [
+            "https://shinden.pl/series/71632-kokoore/episodes",
+            "https://shinden.pl/series/71632-kokoore/all-episodes/?page=2#list",
+        ] {
+            assert_eq!(
+                episode_page_url(url),
+                "https://shinden.pl/series/71632-kokoore/episodes"
+            );
+        }
+    }
+
+    #[test]
     fn resolves_slugless_series_urls_before_loading_episodes() {
-        assert!(requires_series_url_resolution("https://shinden.pl/series/71632"));
-        assert!(requires_series_url_resolution("https://shinden.pl/titles/68581"));
-        assert!(!requires_series_url_resolution("https://shinden.pl/series/71632-kokoore"));
+        assert!(requires_series_url_resolution(
+            "https://shinden.pl/series/71632"
+        ));
+        assert!(requires_series_url_resolution(
+            "https://shinden.pl/titles/68581"
+        ));
+        assert!(!requires_series_url_resolution(
+            "https://shinden.pl/series/71632-kokoore"
+        ));
     }
 }

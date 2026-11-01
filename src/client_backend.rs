@@ -1942,6 +1942,11 @@ async fn scan_watching_item_availability(
     let mut episode_availability = HashMap::new();
 
     for (episode_index, episode) in episodes.into_iter().enumerate() {
+        // Keep the original row index for watched progress, but a title can
+        // list episodes which do not have a playback page yet.
+        if episode.link.is_empty() {
+            continue;
+        }
         let players = get_watching_cache_players(api, &episode.link).await?;
         let availability = watching_episode_availability(&players);
 
@@ -2159,6 +2164,11 @@ fn canonical_title_url_from_search_results(title_id: u64, results: &[Anime]) -> 
         .map(|anime| anime.url.clone())
 }
 
+fn title_url_from_search_results_or_id(title_id: u64, results: &[Anime]) -> String {
+    canonical_title_url_from_search_results(title_id, results)
+        .unwrap_or_else(|| series_url(title_id))
+}
+
 async fn resolve_canonical_title_url(
     api: &ShindenAPI,
     item: &WatchingListApiItem,
@@ -2179,12 +2189,7 @@ async fn resolve_canonical_title_url(
         .await
         .map_err(|error| command_error("resolve_canonical_title_url search", error))?;
 
-    canonical_title_url_from_search_results(item.title_id, &results).ok_or_else(|| {
-        command_error(
-            "resolve_canonical_title_url result",
-            format!("No search result matched title ID {}", item.title_id),
-        )
-    })
+    Ok(title_url_from_search_results_or_id(item.title_id, &results))
 }
 
 async fn resolve_playback_title_url(
@@ -2225,15 +2230,12 @@ async fn resolve_playback_title_url(
         .search_anime(title_name)
         .await
         .map_err(|error| command_error("resolve_playback_title_url search", error))?;
-    let url = canonical_title_url_from_search_results(title_id, &results).ok_or_else(|| {
-        command_error(
-            "resolve_playback_title_url result",
-            format!("No search result matched title ID {title_id}"),
-        )
-    })?;
+    let url = title_url_from_search_results_or_id(title_id, &results);
 
-    cache.canonical_title_urls.insert(title_id, url.clone());
-    save_watching_availability_cache(&cache)?;
+    if is_canonical_title_url(&url, title_id) {
+        cache.canonical_title_urls.insert(title_id, url.clone());
+        save_watching_availability_cache(&cache)?;
+    }
     Ok(url)
 }
 
@@ -4880,6 +4882,24 @@ mod tests {
         assert_eq!(
             canonical_title_url_from_search_results(68581, &results).as_deref(),
             Some("https://shinden.pl/series/68581-bye-bye-earth-2nd-season"),
+        );
+    }
+
+    #[test]
+    fn missing_search_match_falls_back_to_the_requested_title_id() {
+        let results = vec![anime_fixture("https://shinden.pl/series/45667-another-title")];
+        assert_eq!(
+            title_url_from_search_results_or_id(45666, &results),
+            "https://shinden.pl/series/45666"
+        );
+        assert_eq!(
+            title_url_from_search_results_or_id(45666, &[]),
+            "https://shinden.pl/series/45666"
+        );
+        let results = vec![anime_fixture("https://shinden.pl/series/45666-matched-title")];
+        assert_eq!(
+            title_url_from_search_results_or_id(45666, &results),
+            "https://shinden.pl/series/45666-matched-title"
         );
     }
     #[test]
