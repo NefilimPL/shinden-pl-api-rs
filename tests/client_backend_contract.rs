@@ -7,7 +7,7 @@ use shinden_pl_api::models::{SearchFilterRequest, SearchTagSelection};
 
 #[test]
 fn backend_can_be_constructed_without_network_access() {
-    let backend = ShindenClientBackend::new();
+    let backend = ShindenClientBackend::with_library_path(":memory:");
 
     assert!(backend.is_ok());
 }

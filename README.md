@@ -74,6 +74,42 @@ async fn main() -> Result<()> {
 }
 ```
 
+## Local application backend
+
+`client_backend::ShindenClientBackend` uses a SQLite library as its source of
+truth. `new()` opens the OS local-data file
+`shinden-client/library.sqlite3`; `with_library_path(path)` supports a custom
+file or `:memory:` for tests. `SHINDEN_LIBRARY_PATH` overrides the default.
+SQLite is bundled; no database service is needed.
+
+Every new application session starts in Guest. Account profiles have stable
+internal keys derived from their public numeric profile IDs and display their
+nicknames. Every query and resource belongs to a profile. Local status, rating
+and watched-episode updates never POST to Shinden. Existing profiles can be
+selected locally without authenticating. Logout selects Guest.
+
+Network access and public-list import are disabled by default. Use
+`set_library_preferences(network_enabled, import_enabled)` to opt in, then
+`search_public_users(query)` and `import_public_user(profile_url)` to import
+public lists into the profile captured when the import starts. Import validates
+all pages and commits additions in one transaction; existing local progress is
+preserved. Metadata and playback links are saved when fetched. Explicit library
+refresh downloads descriptions, categories and episodes; explicit availability
+refresh checks players. There are no automatic background scans.
+
+Public requests use a separate ephemeral anonymous `ShindenAPI` client. Explicit
+browser login activates an ephemeral account client for protected playback.
+Disabling networking invalidates permission shared by all clients, and replacing
+an account session revokes its clones. The request checks also apply after a
+player preparation delay and before redirects. Requests already in flight may
+finish. HTTP 403/429 and the known Shinden block page disable subsequent requests.
+
+These guarantees apply to `ShindenClientBackend`. Direct `ShindenAPI` methods
+remain remote operations; `ShindenAPI::new()` retains its existing persistent
+cookie behavior for library consumers. `ShindenAPI::anonymous()` neither loads
+nor writes account cookies. Neither local storage nor anonymous HTTP requests
+guarantee that a remote service cannot recognize an IP or a client.
+
 ## Security scanning
 
 Shinden's list API requires the public numeric profile identifier from

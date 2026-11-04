@@ -8,6 +8,7 @@ use reqwest_cookie_store::CookieStoreMutex;
 use std::fs::{File, create_dir_all};
 use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub const BROWSER_VERIFICATION_REQUIRED: &str = "SHINDEN_BROWSER_VERIFICATION_REQUIRED";
@@ -33,10 +34,28 @@ pub struct ShindenAPI {
     pub(crate) image_client: Client,
     jar: Arc<CookieStoreMutex>,
     cookie_path: PathBuf,
+    persistent: bool,
+    network_permission: Arc<AtomicBool>,
+    requests_valid: Arc<AtomicBool>,
     browser_user_agent: Arc<RwLock<Option<HeaderValue>>>,
 }
 
 impl ShindenAPI {
+    pub fn revoke_requests(&self) {
+        self.requests_valid.store(false, Ordering::SeqCst);
+    }
+
+    pub fn ensure_network_allowed(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.network_permission.load(Ordering::SeqCst),
+            "Połączenia z Shinden zostały wyłączone."
+        );
+        anyhow::ensure!(
+            self.requests_valid.load(Ordering::SeqCst),
+            "Sesja została zakończona. Otwórz odtwarzacz ponownie."
+        );
+        Ok(())
+    }
     pub fn new() -> Result<Self> {
         let mut cookie_path =
             dirs::data_local_dir().context("Could not find user local data directory")?;
@@ -47,32 +66,82 @@ impl ShindenAPI {
         Self::with_cookie_path(cookie_path)
     }
 
+    pub fn anonymous() -> Result<Self> {
+        Self::anonymous_with_permission(Arc::new(AtomicBool::new(true)))
+    }
+
+    pub fn anonymous_with_permission(permission: Arc<AtomicBool>) -> Result<Self> {
+        Self::build(PathBuf::new(), false, permission)
+    }
+
+    pub fn clear_session(&self) -> Result<()> {
+        *self
+            .jar
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cookie store unavailable"))? = CookieStore::default();
+        *self
+            .browser_user_agent
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(())
+    }
+
     fn with_cookie_path(cookie_path: PathBuf) -> Result<Self> {
-        let store = load_cookies(&cookie_path)?;
+        Self::build(cookie_path, true, Arc::new(AtomicBool::new(true)))
+    }
+
+    fn build(
+        cookie_path: PathBuf,
+        persistent: bool,
+        network_permission: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let store = if persistent {
+            load_cookies(&cookie_path)?
+        } else {
+            CookieStore::default()
+        };
         let jar = Arc::new(CookieStoreMutex::new(store));
         let agent_path = cookie_path.with_file_name("browser-user-agent.json");
-        let browser_user_agent = if agent_path.exists() {
+        let browser_user_agent = if persistent && agent_path.exists() {
             let value: String = serde_json::from_reader(BufReader::new(File::open(agent_path)?))?;
             Some(HeaderValue::from_str(&value).context("Invalid saved browser user agent")?)
         } else {
             None
         };
 
+        let requests_valid = Arc::new(AtomicBool::new(true));
+        let redirect_permission = network_permission.clone();
+        let redirect_valid = requests_valid.clone();
         let client = Client::builder()
             .cookie_provider(jar.clone())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::default())
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if !redirect_permission.load(Ordering::SeqCst)
+                    || !redirect_valid.load(Ordering::SeqCst)
+                {
+                    attempt.error("Shinden request cancelled")
+                } else if attempt.previous().len() >= 10 {
+                    attempt.error("Too many redirects")
+                } else {
+                    attempt.follow()
+                }
+            }))
             .gzip(true)
             .deflate(true)
             .brotli(true)
             .build()?;
 
+        let image_permission = network_permission.clone();
+        let image_valid = requests_valid.clone();
         let image_client = Client::builder()
             .cookie_provider(jar.clone())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if !image_permission.load(Ordering::SeqCst) || !image_valid.load(Ordering::SeqCst) {
+                    return attempt.error("Shinden request cancelled");
+                }
                 if !crate::images::is_trusted_image_url(attempt.url()) {
                     attempt.error("Unsupported Shinden image redirect")
                 } else if attempt.previous().len() >= 5 {
@@ -88,12 +157,18 @@ impl ShindenAPI {
             image_client,
             jar,
             cookie_path,
+            persistent,
+            network_permission,
+            requests_valid,
             browser_user_agent: Arc::new(RwLock::new(browser_user_agent)),
         })
     }
 
     /// All requests using browser clearance must present that browser's user agent.
     pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
+        if self.ensure_network_allowed().is_err() {
+            return self.client.request(method, "");
+        }
         let mut request = self.client.request(method, url);
         let agent = self
             .browser_user_agent
@@ -186,26 +261,33 @@ impl ShindenAPI {
             .browser_user_agent
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        serde_json::to_writer(
-            BufWriter::new(File::create(
-                self.cookie_path.with_file_name("browser-user-agent.json"),
-            )?),
-            user_agent,
-        )?;
-        save_cookies(&updated, &self.cookie_path)?;
+        if self.persistent {
+            serde_json::to_writer(
+                BufWriter::new(File::create(
+                    self.cookie_path.with_file_name("browser-user-agent.json"),
+                )?),
+                user_agent,
+            )?;
+            save_cookies(&updated, &self.cookie_path)?;
+        }
         *store = updated;
         *agent = Some(user_agent_header);
         Ok(())
     }
 
     pub async fn get_html(&self, url: &str) -> Result<String> {
+        self.ensure_network_allowed()?;
         let response = self.frontend_response(url).await?;
         let body = response.text().await?;
-        save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        ensure_accessible_html(&body)?;
+        if self.persistent {
+            save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        }
         Ok(body)
     }
 
     async fn frontend_response(&self, url: &str) -> Result<Response> {
+        self.ensure_network_allowed()?;
         let headers = self.headers(RequestType::Frontend, url)?;
         let response = self
             .request(Method::GET, url)
@@ -234,6 +316,7 @@ impl ShindenAPI {
     }
 
     pub(crate) async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
+        self.ensure_network_allowed()?;
         let headers = self.headers(RequestType::Api, url)?;
         let response = self
             .request(Method::GET, url)
@@ -241,15 +324,21 @@ impl ShindenAPI {
             .header("X-Requested-With", "XMLHttpRequest")
             .send()
             .await?;
-        let body = check_response(response)?.json().await?;
-        save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        let text = check_response(response)?.text().await?;
+        ensure_accessible_html(&text)?;
+        let body = serde_json::from_str(&text)?;
+        if self.persistent {
+            save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        }
         Ok(body)
     }
     pub async fn resolve_final_url(&self, url: &str) -> Result<String> {
         let response = self.frontend_response(url).await?;
 
         let resolved_url = response.url().to_string();
-        save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        if self.persistent {
+            save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        }
         Ok(resolved_url)
     }
 
@@ -259,6 +348,7 @@ impl ShindenAPI {
         form: &[(String, String)],
         custom_headers: Option<reqwest::header::HeaderMap>,
     ) -> Result<String> {
+        self.ensure_network_allowed()?;
         let mut headers = self.headers(RequestType::Login, url)?;
 
         if let Some(ch) = custom_headers {
@@ -274,7 +364,9 @@ impl ShindenAPI {
         let response = check_response(response)?;
 
         let body = response.text().await?;
-        save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        if self.persistent {
+            save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        }
         Ok(body)
     }
 }
@@ -315,6 +407,17 @@ fn load_cookies(path: &std::path::Path) -> Result<CookieStore> {
     }
 }
 
+pub(crate) fn ensure_accessible_html(html: &str) -> Result<()> {
+    if html.contains("Ten program od lat pobiera dane z shinden.pl")
+        || html.contains("Dostęp z tego konta i tego adresu został zablokowany")
+    {
+        anyhow::bail!(
+            "SHINDEN_ACCESS_BLOCKED: Shinden zablokował dostęp. Lokalna biblioteka pozostaje dostępna."
+        );
+    }
+    Ok(())
+}
+
 fn save_cookies(store: &CookieStore, path: &std::path::Path) -> Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -327,6 +430,82 @@ fn save_cookies(store: &CookieStore, path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn review_block_pages_are_not_treated_as_malformed_json() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            let body = "Ten program od lat pobiera dane z shinden.pl";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let result = ShindenAPI::anonymous().unwrap().get_json(&url).await;
+        server.join().unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SHINDEN_ACCESS_BLOCKED")
+        );
+    }
+
+    #[test]
+    fn review_anonymous_sessions_do_not_load_or_share_account_cookies() {
+        let public = ShindenAPI::anonymous().unwrap();
+        let account = ShindenAPI::anonymous().unwrap();
+        account
+            .import_browser_session("Browser", &["sessionlogin=secret; Secure; Path=/".into()])
+            .unwrap();
+        assert_eq!(public.jar.lock().unwrap().iter_any().count(), 0);
+        assert_eq!(account.jar.lock().unwrap().iter_any().count(), 1);
+        assert!(!public.persistent && !account.persistent);
+    }
+
+    #[tokio::test]
+    async fn review_revoked_client_cannot_issue_later_requests() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(300) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                        .unwrap();
+                    let mut buf = [0; 4096];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                    );
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            false
+        });
+        let api = ShindenAPI::anonymous().unwrap();
+        api.revoke_requests();
+        let result = api.get_html(&url).await;
+        assert!(
+            !server.join().unwrap(),
+            "A revoked session sent an HTTP request"
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn missing_series_route_resolves_to_titles_before_loading_episodes() {

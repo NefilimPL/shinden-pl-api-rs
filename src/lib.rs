@@ -9,3 +9,5 @@ pub mod player;
 pub mod client_backend;
 pub mod details;
 pub mod images;
+pub mod local_library;
+pub mod public_users;

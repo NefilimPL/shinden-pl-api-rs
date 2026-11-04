@@ -1,17 +1,22 @@
+#![cfg_attr(test, allow(dead_code))]
+
 use crate::client::ShindenAPI;
-use crate::details::{
-    AnimeDetails, AnimeRatingUpdate, anime_rating_url, basic_auth_token, normalize_rating_type,
-    rating_update_form,
-};
+use crate::details::{AnimeDetails, AnimeRatingUpdate};
 use crate::models::{Anime, Episode, Player, SearchFilterCatalog, SearchFilterRequest};
+#[cfg(test)]
 use futures_util::stream::{self, StreamExt};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, ORIGIN, REFERER};
+use reqwest::header::ACCEPT;
+#[cfg(test)]
+use reqwest::header::{CONTENT_TYPE, ORIGIN, REFERER};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc,Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
@@ -24,12 +29,18 @@ const WATCHING_LIST_STATUSES: [&str; 6] = [
     "dropped",
     "plan",
 ];
+#[cfg(test)]
 const WATCHING_CACHE_TTL_MS: u64 = 2 * 60 * 60 * 1000;
+#[cfg(test)]
 const WATCHING_CACHE_REFRESH_CONCURRENCY: usize = 1;
+#[cfg(test)]
 const WATCHING_CACHE_REQUEST_RETRIES: usize = 2;
+#[cfg(test)]
 const WATCHING_CACHE_RETRY_DELAY_MS: u64 = 750;
 const BACKGROUND_REQUEST_SPACING_MS: u64 = 900;
+#[cfg(test)]
 const USER_ANIME_LIST_DETAIL_REFRESH_CONCURRENCY: usize = 1;
+#[cfg(test)]
 const PUBLIC_PROFILE_ID_CACHE_TTL_MS: u64 = 60 * 60 * 1000;
 const SHINDEN_TITLE_PLACEHOLDER: &str =
     "https://shinden.pl/res/other/placeholders/title/100x100.jpg";
@@ -50,6 +61,7 @@ struct WatchingListApiResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct TitleEpisodesApiResponse {
     success: bool,
     message: Option<String>,
@@ -100,6 +112,7 @@ struct TitleEpisodeTitleApiItem {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg(test)]
 struct ShindenWriteResponse {
     success: bool,
     message: Option<String>,
@@ -107,6 +120,7 @@ struct ShindenWriteResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct TitleStatusApiResponse {
     success: bool,
     message: Option<String>,
@@ -115,12 +129,14 @@ struct TitleStatusApiResponse {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct TitleStatusApiResult {
     title: Option<TitleStatusApiTitle>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct TitleStatusApiTitle {
     watch_status: Option<String>,
     is_favourite: Option<u8>,
@@ -177,6 +193,7 @@ impl WatchingAnimeFilter {
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct WatchingAvailabilityCache {
     entries: HashMap<String, WatchingAvailabilityCacheEntry>,
     #[serde(default)]
@@ -185,6 +202,7 @@ struct WatchingAvailabilityCache {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct WatchingAvailabilityCacheEntry {
     title_id: u64,
     watched_episodes_cnt: u32,
@@ -255,6 +273,7 @@ pub struct UserAnimeListRefreshSummary {
     pub already_running: bool,
 }
 
+#[cfg(test)]
 struct WatchingCacheRefreshPlan {
     items_to_scan: Vec<WatchingListApiItem>,
     skipped: usize,
@@ -266,12 +285,13 @@ struct WatchingCacheRefreshPlan {
 // Explicit naming avoids CodeQL's heuristic that treats generic `user_id`
 // variables as sensitive, including when they appear in HTTPS URLs.
 #[derive(Debug, Clone, Default)]
+#[cfg(test)]
 struct CachedPublicProfileId {
     public_profile_id: Option<String>,
     checked_at_ms: u64,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct WatchingAnime {
     #[serde(rename = "titleId")]
     pub title_id: u64,
@@ -349,6 +369,7 @@ pub struct UserAnimeListsPayload {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct UserAnimeListCache {
     items: HashMap<String, UserAnimeListItem>,
     refreshed_at_ms: Option<u64>,
@@ -356,6 +377,7 @@ struct UserAnimeListCache {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct UserAnimeListRefreshState {
     queue: Vec<UserAnimeListRefreshQueueItem>,
     started_at_ms: Option<u64>,
@@ -365,6 +387,7 @@ struct UserAnimeListRefreshState {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct UserAnimeListRefreshQueueItem {
     key: String,
     title_id: u64,
@@ -374,7 +397,7 @@ struct UserAnimeListRefreshQueueItem {
     failed: bool,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchAnime {
     #[serde(flatten)]
@@ -385,7 +408,7 @@ pub struct SearchAnime {
     pub total_episodes: Option<u32>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchAnimePage {
     pub items: Vec<SearchAnime>,
@@ -393,7 +416,7 @@ pub struct SearchAnimePage {
     pub total_pages: u32,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 pub struct DiscoveryAnime {
     pub name: String,
     pub url: String,
@@ -428,7 +451,7 @@ struct DiscoveryAnimeBase {
     source_label: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EpisodeProgress {
     pub title: String,
@@ -443,12 +466,14 @@ pub struct EpisodeProgress {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct TitleStatusChangePayload {
     input: Vec<TitleStatusChangeInput>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct TitleStatusChangeInput {
     title_id: u64,
     watch_status: Option<&'static str>,
@@ -459,6 +484,7 @@ struct TitleStatusChangeInput {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct WatchedEpisodesChangePayload {
     title_id: u64,
     episodes: Vec<WatchedEpisodeChangeInput>,
@@ -466,726 +492,34 @@ struct WatchedEpisodesChangePayload {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(test)]
 struct WatchedEpisodeChangeInput {
     episode_id: u64,
     view_cnt: u32,
     created_time: String,
 }
 
+struct AccountSession {
+    api: ShindenAPI,
+    profile: Option<String>,
+    generation: u64,
+}
+
 pub struct ShindenClientBackend {
     api: ShindenAPI,
-    refresh_status: Mutex<WatchingCacheRefreshStatus>,
-    user_anime_list_refresh_status: Mutex<UserAnimeListRefreshStatus>,
-    public_profile_id_cache: Mutex<CachedPublicProfileId>,
+    network_permission: Arc<AtomicBool>,
+    import_generation: AtomicU64,
+    account_session: Mutex<AccountSession>,
+    library: crate::local_library::LocalLibrary,
+    refresh_status: Mutex<HashMap<String,Arc<Mutex<WatchingCacheRefreshStatus>>>>,
+    user_anime_list_refresh_status: Mutex<HashMap<String,Arc<Mutex<UserAnimeListRefreshStatus>>>>,
 }
 
-impl ShindenClientBackend {
-    pub fn new() -> Result<Self, String> {
-        let api = ShindenAPI::new().map_err(|error| {
-            let _ = append_project_log("FATAL", &format!("Failed to create ShindenAPI: {error}"));
-            format!("Failed to create ShindenAPI: {error}")
-        })?;
-
-        Ok(Self {
-            api,
-            refresh_status: Mutex::new(WatchingCacheRefreshStatus::default()),
-            user_anime_list_refresh_status: Mutex::new(UserAnimeListRefreshStatus::default()),
-            public_profile_id_cache: Mutex::new(CachedPublicProfileId::default()),
-        })
-    }
-
-    pub fn write_log(&self, level: String, message: String) -> Result<(), String> {
-        discard_log_path(append_project_log(&level, &message))
-    }
-
-    pub async fn test_connection(&self) -> Result<(), String> {
-        match self.api.get_html("https://shinden.pl/").await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(command_error(
-                "test_connection",
-                format!("Connection failed: {}", e),
-            )),
-        }
-    }
-
-    pub async fn get_image(&self, url: &str) -> Result<crate::images::ShindenImage, String> {
-        self.api.get_image(url).await.map_err(|error| error.to_string())
-    }
-
-    pub async fn search(&self, query: String) -> Result<Vec<SearchAnime>, String> {
-        let results = self
-            .api
-            .search_anime(&query)
-            .await
-            .map_err(|e| command_error("search", e))?;
-
-        let watching_items = fetch_all_userlist_items(&self.api, &self.public_profile_id_cache)
-            .await
-            .unwrap_or_default();
-
-        Ok(map_search_anime_results(results, watching_items))
-    }
-
-    pub async fn get_search_filter_catalog(&self) -> Result<SearchFilterCatalog, String> {
-        self.api
-            .get_search_filter_catalog()
-            .await
-            .map_err(|error| command_error("get_search_filter_catalog", error))
-    }
-
-    pub async fn search_with_filters(
-        &self,
-        request: SearchFilterRequest,
-    ) -> Result<SearchAnimePage, String> {
-        let page = self
-            .api
-            .search_anime_with_filters(&request)
-            .await
-            .map_err(|error| command_error("search_with_filters", error))?;
-
-        let watching_items = fetch_all_userlist_items(&self.api, &self.public_profile_id_cache)
-            .await
-            .unwrap_or_default();
-
-        Ok(SearchAnimePage {
-            items: map_search_anime_results(page.items, watching_items),
-            current_page: page.current_page,
-            total_pages: page.total_pages,
-        })
-    }
-
-    pub async fn get_main_premieres(&self) -> Result<Vec<DiscoveryAnime>, String> {
-        let html = self
-            .api
-            .get_html(SHINDEN_MAIN_URL)
-            .await
-            .map_err(|e| command_error("get_main_premieres", e))?;
-
-        let watching_items = fetch_all_userlist_items(&self.api, &self.public_profile_id_cache)
-            .await
-            .unwrap_or_default();
-
-        Ok(map_discovery_anime_results(
-            parse_main_premieres_html(&html),
-            watching_items,
-        ))
-    }
-
-    pub async fn get_season_anime(
-        &self,
-        year: Option<u16>,
-        season: String,
-    ) -> Result<Vec<DiscoveryAnime>, String> {
-        let url = season_page_url(year, &season);
-        let html = self
-            .api
-            .get_html(&url)
-            .await
-            .map_err(|e| command_error("get_season_anime", e))?;
-
-        let watching_items = fetch_all_userlist_items(&self.api, &self.public_profile_id_cache)
-            .await
-            .unwrap_or_default();
-
-        Ok(map_discovery_anime_results(
-            parse_season_anime_html(&html),
-            watching_items,
-        ))
-    }
-
-    pub async fn get_anime_details(&self, url: String) -> Result<AnimeDetails, String> {
-        let details = self
-            .api
-            .get_anime_details(&url)
-            .await
-            .map_err(|e| command_error("get_anime_details", e))?;
-
-        let (title_status, user_status_loaded) = match details.title_id {
-            Some(title_id) => match fetch_current_public_profile_id_cached(
-                &self.api,
-                &self.public_profile_id_cache,
-                "get_anime_details",
-            )
-            .await
-            {
-                Ok(public_profile_id) => {
-                    match fetch_title_status(&self.api, title_id, &public_profile_id).await {
-                        Ok(title_status) => (title_status, true),
-                        Err(error) => {
-                            let _ = command_error("get_anime_details status fallback", error);
-                            (None, false)
-                        }
-                    }
-                },
-                Err(error) => {
-                    let _ = command_error("get_anime_details user fallback", error);
-                    (None, false)
-                }
-            },
-            None => (None, false),
-        };
-
-        Ok(anime_details_with_title_status(
-            details,
-            title_status,
-            user_status_loaded,
-        ))
-    }
-
-    pub async fn get_watching_anime(
-        &self,
-        filter: Option<WatchingAnimeFilter>,
-    ) -> Result<Vec<WatchingAnime>, String> {
-        let filter = filter.unwrap_or_default();
-        let cache = load_watching_availability_cache();
-        if !watching_filter_requires_availability_cache(&filter) {
-            let cached_anime = cached_watching_anime(&load_user_anime_list_cache());
-            if !cached_anime.is_empty() {
-                return Ok(cached_anime);
-            }
-        }
-
-        let items = fetch_all_watching_items(&self.api, &self.public_profile_id_cache).await?;
-        let mut canonical_urls = cached_canonical_title_urls(&load_user_anime_list_cache());
-        canonical_urls.extend(
-            cache.canonical_title_urls.iter()
-                .filter(|(title_id, url)| is_canonical_title_url(url, **title_id))
-                .map(|(title_id, url)| (*title_id, url.clone())),
-        );
-        let mut anime = Vec::new();
-
-        for item in items
-            .into_iter()
-            .filter(|item| watching_cache_filter_matches(item, &filter, &cache))
-        {
-            let url = canonical_url_from_cache_or_fallback(item.title_id, &canonical_urls);
-
-            if let Some(item) = map_watching_list_item_details_with_url(item, url) {
-                anime.push(item);
-            }
-        }
-
-        Ok(anime)
-    }
-
-    pub async fn get_user_anime_lists(
-        &self,
-        force_refresh: Option<bool>,
-    ) -> Result<UserAnimeListsPayload, String> {
-        let force_refresh = force_refresh.unwrap_or(false);
-        let mut cache = load_user_anime_list_cache();
-        let now_ms = unix_timestamp_ms_u64();
-
-        if should_return_cached_user_anime_lists(&cache, force_refresh) {
-            let active_items = active_user_anime_list_items(&cache);
-            return Ok(user_anime_lists_payload(
-                active_items,
-                cache.refreshed_at_ms,
-                None,
-            ));
-        }
-
-        match fetch_all_userlist_items(&self.api, &self.public_profile_id_cache).await {
-            Ok(items) => {
-                let existing_keys = user_anime_list_cache_keys(&cache);
-                merge_user_anime_list_cache(&mut cache, items, force_refresh, now_ms);
-                let new_keys = new_active_user_anime_list_cache_keys(&cache, &existing_keys);
-                let active_items = active_user_anime_list_items(&cache);
-                cache.refreshed_at_ms = Some(now_ms);
-                save_user_anime_list_cache(&cache)?;
-
-                let sync_error = if force_refresh {
-                    refresh_new_user_anime_detail_metadata(
-                        &self.api,
-                        &mut cache,
-                        new_keys,
-                        now_ms,
-                    )
-                    .await
-                } else {
-                    None
-                };
-                if force_refresh {
-                    save_user_anime_list_cache(&cache)?;
-                }
-
-                Ok(user_anime_lists_payload(
-                    active_items,
-                    cache.refreshed_at_ms,
-                    sync_error,
-                ))
-            }
-            Err(error) => {
-                let active_items = active_user_anime_list_items(&cache);
-                if active_items.is_empty() {
-                    Err(error)
-                } else {
-                    Ok(user_anime_lists_payload(
-                        active_items,
-                        cache.refreshed_at_ms,
-                        Some(error),
-                    ))
-                }
-            }
-        }
-    }
-
-    pub fn get_user_anime_list_refresh_status(&self) -> Result<UserAnimeListRefreshStatus, String> {
-        user_anime_list_refresh_status_snapshot(&self.user_anime_list_refresh_status)
-    }
-
-    pub async fn refresh_user_anime_list_cache(
-        &self,
-    ) -> Result<UserAnimeListRefreshSummary, String> {
-        if let Some(summary) =
-            begin_user_anime_list_refresh(&self.user_anime_list_refresh_status, None)?
-        {
-            return Ok(summary);
-        }
-
-        let refresh_result = refresh_user_anime_list_cache_inner(
-            &self.api,
-            &self.public_profile_id_cache,
-            &self.user_anime_list_refresh_status,
-        )
-        .await;
-
-        match refresh_result {
-            Ok(status) => Ok(UserAnimeListRefreshSummary {
-                status,
-                already_running: false,
-            }),
-            Err(error) => {
-                fail_user_anime_list_refresh(&self.user_anime_list_refresh_status, &error)?;
-                Err(error)
-            }
-        }
-    }
-
-    pub async fn resume_user_anime_list_cache_refresh(
-        &self,
-    ) -> Result<UserAnimeListRefreshSummary, String> {
-        let mut state = load_user_anime_list_refresh_state();
-        if !user_anime_list_refresh_state_has_pending(&state) {
-            let status = user_anime_list_refresh_status_from_state(&state, false);
-            replace_user_anime_list_refresh_status(
-                &self.user_anime_list_refresh_status,
-                status.clone(),
-            )?;
-            return Ok(UserAnimeListRefreshSummary {
-                status,
-                already_running: false,
-            });
-        }
-
-        if let Some(summary) =
-            begin_user_anime_list_refresh(&self.user_anime_list_refresh_status, Some(&state))?
-        {
-            return Ok(summary);
-        }
-
-        let mut cache = load_user_anime_list_cache();
-        let refresh_result = process_user_anime_list_refresh_queue(
-            &self.api,
-            &self.user_anime_list_refresh_status,
-            &mut cache,
-            &mut state,
-        )
-        .await;
-
-        match refresh_result {
-            Ok(status) => Ok(UserAnimeListRefreshSummary {
-                status,
-                already_running: false,
-            }),
-            Err(error) => {
-                fail_user_anime_list_refresh(&self.user_anime_list_refresh_status, &error)?;
-                Err(error)
-            }
-        }
-    }
-
-    pub async fn get_episodes_with_progress(
-        &self,
-        url: String,
-        title_id: Option<u64>,
-        total_episodes: Option<u32>,
-        title_name: Option<String>,
-    ) -> Result<Vec<EpisodeProgress>, String> {
-        let playback_url = match (
-            title_id.or_else(|| title_id_from_series_url(&url).and_then(|value| value.parse::<u64>().ok())),
-            title_name.as_deref(),
-        ) {
-            (Some(resolved_title_id), Some(title_name)) => {
-                resolve_playback_title_url(&self.api, resolved_title_id, title_name, &url).await?
-            }
-            _ => url.clone(),
-        };
-
-        let playback_episodes = self
-            .api
-            .get_episodes(&playback_url)
-            .await
-            .map_err(|e| command_error("get_episodes_with_progress playback", e))?;
-
-        let Some(title_id) = title_id.or_else(|| {
-            title_id_from_series_url(&url).and_then(|title_id| title_id.parse::<u64>().ok())
-        }) else {
-            return Ok(merge_episode_progress(
-                playback_episodes,
-                Vec::new(),
-                total_episodes,
-            ));
-        };
-
-        let progress_episodes = match fetch_current_public_profile_id_cached(
-            &self.api,
-            &self.public_profile_id_cache,
-            "get_episodes_with_progress",
-        )
-        .await
-        {
-            Ok(public_profile_id) => {
-                fetch_title_episode_progress(&self.api, title_id, &public_profile_id)
-                    .await
-                    .unwrap_or_else(|error| {
-                        let _ =
-                            command_error("get_episodes_with_progress progress fallback", error);
-                        Vec::new()
-                    })
-            }
-            Err(error) => {
-                let _ = command_error("get_episodes_with_progress user fallback", error);
-                Vec::new()
-            }
-        };
-
-        Ok(merge_episode_progress(
-            playback_episodes,
-            progress_episodes,
-            total_episodes,
-        ))
-    }
-
-    pub async fn update_anime_status(
-        &self,
-        title_id: u64,
-        status: Option<String>,
-        is_favourite: Option<u8>,
-    ) -> Result<(), String> {
-        let public_profile_id = fetch_current_public_profile_id_cached(
-            &self.api,
-            &self.public_profile_id_cache,
-            "update_anime_status",
-        )
-        .await?;
-        let current_status = fetch_title_status(&self.api, title_id, &public_profile_id)
-            .await
-            .unwrap_or_default();
-        let payload = build_title_status_payload_with_details(
-            title_id,
-            status.as_deref(),
-            is_favourite.or_else(|| {
-                current_status
-                    .as_ref()
-                    .and_then(|status| status.is_favourite)
-            }),
-            current_status
-                .as_ref()
-                .and_then(|status| status.priority)
-                .unwrap_or_default(),
-            current_status
-                .as_ref()
-                .and_then(|status| status.recommend)
-                .unwrap_or_default(),
-        )?;
-
-        post_shinden_json(
-            &self.api,
-            "https://lista.shinden.pl/api/title-status-change",
-            &payload,
-            "update_anime_status",
-        )
-        .await?;
-
-        match verify_title_status_change_with_user(
-            &self.api,
-            title_id,
-            &public_profile_id,
-            status.as_deref(),
-            "update_anime_status",
-        )
-        .await
-        {
-            Ok(()) => Ok(()),
-            Err(verify_error) => {
-                let _ = append_project_log(
-                    "WARNING",
-                    &format!(
-                        "update_anime_status fallback after failed list verification: {verify_error}"
-                    ),
-                );
-                post_legacy_anime_status(
-                    &self.api,
-                    title_id,
-                    &public_profile_id,
-                    status.as_deref(),
-                    &payload.input[0],
-                )
-                .await?;
-                verify_title_status_change_with_user(
-                    &self.api,
-                    title_id,
-                    &public_profile_id,
-                    status.as_deref(),
-                    "update_anime_status legacy verify",
-                )
-                .await
-            }
-        }
-    }
-
-    pub async fn update_anime_rating(&self, update: AnimeRatingUpdate) -> Result<(), String> {
-        let rating_type = normalize_rating_type(&update.rating_type).ok_or_else(|| {
-            command_error(
-                "update_anime_rating",
-                format!("Unsupported anime rating type: {}", update.rating_type),
-            )
-        })?;
-        let title_type = if update.title_type.trim().is_empty() {
-            "anime".to_string()
-        } else {
-            update.title_type.trim().to_ascii_lowercase()
-        };
-        let update = AnimeRatingUpdate {
-            title_id: update.title_id,
-            title_type,
-            rating_type,
-            value: update.value.min(10),
-        };
-        let page_html = self
-            .api
-            .get_html(&series_url(update.title_id))
-            .await
-            .map_err(|e| command_error("update_anime_rating auth", e))?;
-        let auth = basic_auth_token(&page_html).ok_or_else(|| {
-            command_error("update_anime_rating auth", "Shinden auth token missing")
-        })?;
-        let response = self
-            .api
-            .post_form(
-                &anime_rating_url(&update.title_type, update.title_id),
-                &rating_update_form(&update, &auth),
-                None,
-            )
-            .await
-            .map_err(|e| command_error("update_anime_rating", e))?;
-
-        if rating_response_is_success(&response) {
-            Ok(())
-        } else {
-            Err(command_error(
-                "update_anime_rating",
-                format!("Shinden rejected rating update: {response}"),
-            ))
-        }
-    }
-
-    pub async fn mark_episode_watched(
-        &self,
-        title_id: u64,
-        episode_id: u64,
-        created_time: String,
-    ) -> Result<(), String> {
-        let payload = build_watched_episode_payload(title_id, episode_id, created_time, 1);
-        post_shinden_json(
-            &self.api,
-            "https://lista.shinden.pl/api/title-watched-episodes-change",
-            &payload,
-            "mark_episode_watched",
-        )
-        .await
-    }
-
-    pub async fn mark_episode_unwatched(
-        &self,
-        title_id: u64,
-        episode_id: u64,
-        created_time: String,
-    ) -> Result<(), String> {
-        let payload = build_watched_episode_payload(title_id, episode_id, created_time, 0);
-        post_shinden_json(
-            &self.api,
-            "https://lista.shinden.pl/api/title-watched-episodes-change",
-            &payload,
-            "mark_episode_unwatched",
-        )
-        .await
-    }
-
-    pub fn get_watching_cache_refresh_status(&self) -> Result<WatchingCacheRefreshStatus, String> {
-        refresh_status_snapshot(&self.refresh_status)
-    }
-
-    pub fn get_watching_episode_availability(
-        &self,
-        title_id: u64,
-    ) -> Option<HashMap<String, WatchingEpisodeAvailability>> {
-        load_watching_availability_cache()
-            .entries
-            .get(&watching_cache_key(title_id))
-            .filter(|entry| entry.title_id == title_id)
-            .map(|entry| entry.episode_availability.clone())
-    }
-
-    pub async fn refresh_watching_anime_cache(
-        &self,
-        filter: Option<WatchingAnimeFilter>,
-        force: Option<bool>,
-    ) -> Result<WatchingCacheRefreshSummary, String> {
-        let filter = filter.unwrap_or_default();
-        let force = force.unwrap_or(false);
-
-        if let Some(summary) = begin_watching_cache_refresh(&self.refresh_status)? {
-            return Ok(summary);
-        }
-
-        let refresh_result = refresh_watching_cache_inner(
-            &self.api,
-            &self.refresh_status,
-            &self.public_profile_id_cache,
-            &filter,
-            force,
-        )
-        .await;
-
-        match refresh_result {
-            Ok(status) => Ok(WatchingCacheRefreshSummary {
-                status,
-                already_running: false,
-            }),
-            Err(error) => {
-                update_refresh_status(&self.refresh_status, |status| {
-                    status.running = false;
-                    status.current_title.clear();
-                    status.last_finished_at_ms = Some(unix_timestamp_ms_u64());
-                    status.last_error = Some(error.clone());
-                })?;
-                Err(error)
-            }
-        }
-    }
-
-    pub async fn refresh_watching_anime_cache_item(
-        &self,
-        title_id: u64,
-        filter: Option<WatchingAnimeFilter>,
-        force: Option<bool>,
-    ) -> Result<WatchingCacheRefreshSummary, String> {
-        let filter = filter.unwrap_or_default();
-        let force = force.unwrap_or(false);
-
-        if let Some(summary) = begin_watching_cache_refresh(&self.refresh_status)? {
-            return Ok(summary);
-        }
-
-        let refresh_result = refresh_watching_cache_item_inner(
-            &self.api,
-            &self.refresh_status,
-            &self.public_profile_id_cache,
-            title_id,
-            &filter,
-            force,
-        )
-        .await;
-
-        match refresh_result {
-            Ok(status) => Ok(WatchingCacheRefreshSummary {
-                status,
-                already_running: false,
-            }),
-            Err(error) => {
-                update_refresh_status(&self.refresh_status, |status| {
-                    status.running = false;
-                    status.current_title.clear();
-                    status.last_finished_at_ms = Some(unix_timestamp_ms_u64());
-                    status.last_error = Some(error.clone());
-                })?;
-                Err(error)
-            }
-        }
-    }
-
-    pub fn import_browser_clearance(&self, user_agent: &str, cookie: &str) -> Result<(), String> {
-        self.api
-            .import_browser_clearance(user_agent, cookie)
-            .map_err(|error| command_error("browser clearance", error))
-    }
-
-    pub fn import_browser_session(&self, user_agent: &str, cookies: &[String]) -> Result<(), String> {
-        self.api.import_browser_session(user_agent, cookies)
-            .map_err(|error| command_error("browser login", error))?;
-        clear_cached_public_profile_id(&self.public_profile_id_cache)
-    }
-
-    pub async fn login(&self, username: String, password: String) -> Result<(), String> {
-        let result = self
-            .api
-            .login(&username, &password)
-            .await
-            .map_err(|e| command_error("login", e));
-
-        if result.is_ok() {
-            clear_cached_public_profile_id(&self.public_profile_id_cache)?;
-        }
-
-        result
-    }
-
-    pub async fn logout(&self) -> Result<(), String> {
-        self.api
-            .logout()
-            .await
-            .map_err(|e| command_error("logout", e))?;
-        clear_cached_public_profile_id(&self.public_profile_id_cache)
-    }
-
-    pub async fn get_user_name(&self) -> Result<Option<String>, String> {
-        self.api
-            .get_user_name()
-            .await
-            .map_err(|e| command_error("get_user_name", e))
-    }
-
-    pub async fn get_user_profile_image(&self) -> Result<Option<String>, String> {
-        self.api
-            .get_user_profile_image()
-            .await
-            .map_err(|e| command_error("get_user_profile_image", e))
-    }
-
-    pub async fn get_episodes(&self, url: String) -> Result<Vec<Episode>, String> {
-        self.api
-            .get_episodes(&url)
-            .await
-            .map_err(|e| command_error("get_episodes", e))
-    }
-
-    pub async fn get_players(&self, url: String) -> Result<Vec<Player>, String> {
-        self.api
-            .get_players(&url)
-            .await
-            .map_err(|e| command_error("get_players", e))
-    }
-
-    pub async fn get_iframe(&self, id: String) -> Result<String, String> {
-        self.api
-            .get_player_iframe(&id)
-            .await
-            .map_err(|e| command_error("get_iframe", e))
-    }
-}
-
+#[path = "local_backend.rs"]
+mod local_backend;
+pub use local_backend::ImportSummary;
+
+#[cfg(test)]
 async fn fetch_all_watching_items(
     api: &ShindenAPI,
     public_profile_id_cache: &Mutex<CachedPublicProfileId>,
@@ -1196,6 +530,7 @@ async fn fetch_all_watching_items(
     fetch_all_watching_items_for_status(api, &public_profile_id, "in progress").await
 }
 
+#[cfg(test)]
 async fn fetch_all_userlist_items(
     api: &ShindenAPI,
     public_profile_id_cache: &Mutex<CachedPublicProfileId>,
@@ -1211,6 +546,7 @@ async fn fetch_all_userlist_items(
     Ok(items)
 }
 
+#[cfg(test)]
 async fn fetch_all_watching_items_for_status(
     api: &ShindenAPI,
     public_profile_id: &str,
@@ -1242,6 +578,7 @@ async fn fetch_all_watching_items_for_status(
     Ok(items)
 }
 
+#[cfg(test)]
 async fn fetch_current_public_profile_id(
     api: &ShindenAPI,
     context: &str,
@@ -1256,6 +593,7 @@ async fn fetch_current_public_profile_id(
         .ok_or_else(|| command_error(&profile_context, "User is not logged in"))
 }
 
+#[cfg(test)]
 async fn fetch_current_public_profile_id_cached(
     api: &ShindenAPI,
     public_profile_id_cache: &Mutex<CachedPublicProfileId>,
@@ -1296,10 +634,12 @@ async fn fetch_current_public_profile_id_cached(
     }
 }
 
+#[cfg(test)]
 fn is_transient_user_profile_error(error: &str) -> bool {
     error.contains("429 Too Many Requests") || error.contains("error sending request")
 }
 
+#[cfg(test)]
 fn cached_public_profile_id_if_fresh(cache: &CachedPublicProfileId, now_ms: u64) -> Option<String> {
     let public_profile_id = cache.public_profile_id.as_ref()?;
     if now_ms.saturating_sub(cache.checked_at_ms) <= PUBLIC_PROFILE_ID_CACHE_TTL_MS {
@@ -1309,6 +649,7 @@ fn cached_public_profile_id_if_fresh(cache: &CachedPublicProfileId, now_ms: u64)
     }
 }
 
+#[cfg(test)]
 fn store_cached_public_profile_id(
     public_profile_id_cache: &Mutex<CachedPublicProfileId>,
     public_profile_id: &str,
@@ -1319,6 +660,7 @@ fn store_cached_public_profile_id(
     Ok(())
 }
 
+#[cfg(test)]
 fn store_cached_public_profile_id_value(
     cache: &mut CachedPublicProfileId,
     public_profile_id: &str,
@@ -1328,6 +670,7 @@ fn store_cached_public_profile_id_value(
     cache.checked_at_ms = checked_at_ms;
 }
 
+#[cfg(test)]
 fn clear_cached_public_profile_id(
     public_profile_id_cache: &Mutex<CachedPublicProfileId>,
 ) -> Result<(), String> {
@@ -1336,6 +679,7 @@ fn clear_cached_public_profile_id(
     Ok(())
 }
 
+#[cfg(test)]
 fn lock_public_profile_id_cache(
     public_profile_id_cache: &Mutex<CachedPublicProfileId>,
 ) -> Result<std::sync::MutexGuard<'_, CachedPublicProfileId>, String> {
@@ -1344,6 +688,7 @@ fn lock_public_profile_id_cache(
         .map_err(|_| command_error("user_id_cache", "User id cache lock poisoned"))
 }
 
+#[cfg(test)]
 async fn fetch_shinden_basic_auth(api: &ShindenAPI) -> Result<String, String> {
     let profile_html = api
         .get_html("https://shinden.pl/")
@@ -1361,6 +706,7 @@ async fn fetch_watching_list_status_page(
     limit: usize,
     offset: usize,
 ) -> Result<WatchingListApiResult, String> {
+    api.ensure_network_allowed().map_err(|e|e.to_string())?;
     let url = watching_list_status_url(public_profile_id, status, limit, offset);
     let response = api
         .request(reqwest::Method::GET, &url)
@@ -1370,9 +716,9 @@ async fn fetch_watching_list_status_page(
         .map_err(|e| command_error("get_watching_anime request", e))?;
     let response = crate::client::check_response(response)
         .map_err(|e| command_error("get_watching_anime response", e))?;
-    let payload = response
-        .json::<WatchingListApiResponse>()
-        .await
+    let text = response.text().await.map_err(|e| command_error("get_watching_anime response",e))?;
+    crate::client::ensure_accessible_html(&text).map_err(|e|e.to_string())?;
+    let payload: WatchingListApiResponse = serde_json::from_str(&text)
         .map_err(|e| command_error("get_watching_anime json", e))?;
 
     if !payload.success {
@@ -1385,6 +731,7 @@ async fn fetch_watching_list_status_page(
     Ok(payload.result)
 }
 
+#[cfg(test)]
 async fn fetch_title_status(
     api: &ShindenAPI,
     title_id: u64,
@@ -1419,6 +766,7 @@ async fn fetch_title_status(
     Ok(payload.result.title)
 }
 
+#[cfg(test)]
 fn anime_details_with_title_status(
     mut details: AnimeDetails,
     title_status: Option<TitleStatusApiTitle>,
@@ -1441,6 +789,7 @@ fn anime_details_with_title_status(
     details
 }
 
+#[cfg(test)]
 async fn fetch_title_episode_progress(
     api: &ShindenAPI,
     title_id: u64,
@@ -1475,6 +824,7 @@ async fn fetch_title_episode_progress(
     Ok(payload.result.items)
 }
 
+#[cfg(test)]
 async fn post_shinden_json<T: Serialize>(
     api: &ShindenAPI,
     url: &str,
@@ -1514,6 +864,7 @@ async fn post_shinden_json<T: Serialize>(
     }
 }
 
+#[cfg(test)]
 async fn post_legacy_anime_status(
     api: &ShindenAPI,
     title_id: u64,
@@ -1584,6 +935,7 @@ async fn post_legacy_anime_status(
     }))
 }
 
+#[cfg(test)]
 async fn post_legacy_anime_status_delete(
     api: &ShindenAPI,
     title_id: u64,
@@ -1614,6 +966,7 @@ async fn post_legacy_anime_status_delete(
     )
 }
 
+#[cfg(test)]
 fn validate_legacy_write_response(response_text: String) -> Result<(), String> {
     let trimmed = response_text.trim();
     if trimmed.is_empty() {
@@ -1651,6 +1004,7 @@ fn validate_legacy_write_response(response_text: String) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn verify_title_status_change_with_user(
     api: &ShindenAPI,
     title_id: u64,
@@ -1708,6 +1062,7 @@ async fn verify_title_status_change_with_user(
     }
 }
 
+#[cfg(test)]
 async fn refresh_watching_cache_inner(
     api: &ShindenAPI,
     status: &Mutex<WatchingCacheRefreshStatus>,
@@ -1799,6 +1154,7 @@ async fn refresh_watching_cache_inner(
     refresh_status_snapshot(status)
 }
 
+#[cfg(test)]
 async fn refresh_watching_cache_item_inner(
     api: &ShindenAPI,
     status: &Mutex<WatchingCacheRefreshStatus>,
@@ -1880,6 +1236,7 @@ async fn refresh_watching_cache_item_inner(
     }
 }
 
+#[cfg(test)]
 fn finish_single_watching_cache_refresh(
     status: &Mutex<WatchingCacheRefreshStatus>,
     refreshed: bool,
@@ -1899,6 +1256,7 @@ fn finish_single_watching_cache_refresh(
     refresh_status_snapshot(status)
 }
 
+#[cfg(test)]
 fn collect_watching_cache_refresh_plan(
     items: &[WatchingListApiItem],
     cache: &WatchingAvailabilityCache,
@@ -1933,6 +1291,7 @@ fn collect_watching_cache_refresh_plan(
     }
 }
 
+#[cfg(test)]
 async fn scan_watching_item_availability(
     api: &ShindenAPI,
     item: &WatchingListApiItem,
@@ -2020,6 +1379,7 @@ where
     has_players
 }
 
+#[cfg(test)]
 async fn get_watching_cache_episodes(
     api: &ShindenAPI,
     series_url: &str,
@@ -2041,6 +1401,7 @@ async fn get_watching_cache_episodes(
     Err(format!("Nie udalo sie pobrac listy odcinkow: {last_error}"))
 }
 
+#[cfg(test)]
 async fn get_watching_cache_players(
     api: &ShindenAPI,
     episode_url: &str,
@@ -2062,6 +1423,7 @@ async fn get_watching_cache_players(
     Err(format!("Nie udalo sie sprawdzic odcinka: {last_error}"))
 }
 
+#[cfg(test)]
 fn wait_before_watching_cache_retry(attempt: usize) {
     if attempt < WATCHING_CACHE_REQUEST_RETRIES {
         std::thread::sleep(Duration::from_millis(WATCHING_CACHE_RETRY_DELAY_MS));
@@ -2072,6 +1434,7 @@ async fn wait_before_background_request() {
     sleep(Duration::from_millis(BACKGROUND_REQUEST_SPACING_MS)).await;
 }
 
+#[cfg(test)]
 fn log_watching_cache_retry(context: &str, url: &str, attempt: usize, error: &str) {
     let _ = append_project_log(
         "WARNING",
@@ -2083,6 +1446,7 @@ fn log_watching_cache_retry(context: &str, url: &str, attempt: usize, error: &st
     );
 }
 
+#[cfg(test)]
 fn watching_cache_item_error_message(title: &str) -> String {
     format!("Nie udalo sie sprawdzic: {title}")
 }
@@ -2100,6 +1464,7 @@ fn watching_list_status_url(
     )
 }
 
+#[cfg(test)]
 fn title_status_url(title_id: u64, public_profile_id: &str) -> String {
     format!("https://lista.shinden.pl/api/title-status/{title_id}/{public_profile_id}")
 }
@@ -2146,6 +1511,7 @@ fn normalize_polish_ascii(value: &str) -> String {
     normalized
 }
 
+#[cfg(test)]
 fn legacy_userlist_series_url(public_profile_id: &str, title_id: u64) -> String {
     format!("https://shinden.pl/api/userlist/{public_profile_id}/series/{title_id}")
 }
@@ -2154,11 +1520,13 @@ fn series_url(title_id: u64) -> String {
     format!("https://shinden.pl/series/{title_id}")
 }
 
+#[cfg(test)]
 fn rating_response_is_success(response: &str) -> bool {
     let normalized = response.trim().to_ascii_lowercase();
     normalized == "ok" || normalized.contains("\"success\":true")
 }
 
+#[cfg(test)]
 fn canonical_title_url_from_search_results(title_id: u64, results: &[Anime]) -> Option<String> {
     results
         .iter()
@@ -2170,11 +1538,13 @@ fn canonical_title_url_from_search_results(title_id: u64, results: &[Anime]) -> 
         .map(|anime| anime.url.clone())
 }
 
+#[cfg(test)]
 fn title_url_from_search_results_or_id(title_id: u64, results: &[Anime]) -> String {
     canonical_title_url_from_search_results(title_id, results)
         .unwrap_or_else(|| series_url(title_id))
 }
 
+#[cfg(test)]
 async fn resolve_canonical_title_url(
     api: &ShindenAPI,
     item: &WatchingListApiItem,
@@ -2198,6 +1568,7 @@ async fn resolve_canonical_title_url(
     Ok(title_url_from_search_results_or_id(item.title_id, &results))
 }
 
+#[cfg(test)]
 async fn resolve_playback_title_url(
     api: &ShindenAPI,
     title_id: u64,
@@ -2245,6 +1616,7 @@ async fn resolve_playback_title_url(
     Ok(url)
 }
 
+#[cfg(test)]
 fn is_canonical_title_url(url: &str, title_id: u64) -> bool {
     ["/series/", "/titles/"]
         .iter()
@@ -2257,6 +1629,7 @@ fn is_canonical_title_url(url: &str, title_id: u64) -> bool {
         })
 }
 
+#[cfg(test)]
 fn cached_canonical_title_urls(cache: &UserAnimeListCache) -> HashMap<u64, String> {
     cache
         .items
@@ -2266,6 +1639,7 @@ fn cached_canonical_title_urls(cache: &UserAnimeListCache) -> HashMap<u64, Strin
         .collect()
 }
 
+#[cfg(test)]
 fn canonical_url_from_cache_or_fallback(title_id: u64, urls: &HashMap<u64, String>) -> String {
     urls
         .get(&title_id)
@@ -2279,6 +1653,7 @@ fn title_id_from_series_url(url: &str) -> Option<String> {
         .find_map(|marker| extract_ascii_digits_after(url, marker))
 }
 
+#[cfg(test)]
 fn title_episodes_url(title_id: u64, public_profile_id: &str) -> String {
     format!("https://lista.shinden.pl/api/title-episodes/{title_id}/{public_profile_id}")
 }
@@ -2332,6 +1707,7 @@ fn episode_number_from_playback_title(title: &str) -> Option<u32> {
     suffix.chars().take_while(|character| character.is_ascii_digit()).collect::<String>().parse().ok()
 }
 
+#[cfg(test)]
 fn extract_shinden_basic_auth(html: &str) -> Option<String> {
     [
         "_Storage.basic = \"",
@@ -2364,6 +1740,7 @@ fn extract_ascii_digits_after(source: &str, marker: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn extract_until_quote_after(source: &str, marker: &str) -> Option<String> {
     let start = source.find(marker)? + marker.len();
     let quote = marker.chars().last()?;
@@ -2711,6 +2088,7 @@ fn shinden_watch_status_value(status: Option<&str>) -> Result<Option<&'static st
     }
 }
 
+#[cfg(test)]
 fn shinden_legacy_watch_status_values(status: Option<&str>) -> Result<Vec<&'static str>, String> {
     Ok(match shinden_watch_status_value(status)? {
         Some("in progress") => vec!["in progress", "in-progress", "watching"],
@@ -2724,6 +2102,7 @@ fn shinden_legacy_watch_status_values(status: Option<&str>) -> Result<Vec<&'stat
     })
 }
 
+#[cfg(test)]
 fn title_status_matches(found: Option<&str>, expected: Option<&str>) -> Result<bool, String> {
     Ok(shinden_watch_status_value(found)? == shinden_watch_status_value(expected)?)
 }
@@ -2749,6 +2128,7 @@ fn build_title_status_payload(
     build_title_status_payload_with_details(title_id, status, is_favourite, 0, 0)
 }
 
+#[cfg(test)]
 fn build_title_status_payload_with_details(
     title_id: u64,
     status: Option<&str>,
@@ -2767,6 +2147,7 @@ fn build_title_status_payload_with_details(
     })
 }
 
+#[cfg(test)]
 fn build_watched_episode_payload(
     title_id: u64,
     episode_id: u64,
@@ -2788,6 +2169,7 @@ fn map_watching_list_item_details(item: WatchingListApiItem) -> Option<WatchingA
     map_watching_list_item_details_with_url(item, url)
 }
 
+#[cfg(test)]
 fn cached_watching_anime(cache: &UserAnimeListCache) -> Vec<WatchingAnime> {
     active_user_anime_list_items(cache)
         .into_iter()
@@ -2878,6 +2260,7 @@ fn map_user_anime_list_item(
     })
 }
 
+#[cfg(test)]
 async fn refresh_user_anime_list_cache_inner(
     api: &ShindenAPI,
     public_profile_id_cache: &Mutex<CachedPublicProfileId>,
@@ -2901,6 +2284,7 @@ async fn refresh_user_anime_list_cache_inner(
     process_user_anime_list_refresh_queue(api, status, &mut cache, &mut state).await
 }
 
+#[cfg(test)]
 async fn process_user_anime_list_refresh_queue(
     api: &ShindenAPI,
     status: &Mutex<UserAnimeListRefreshStatus>,
@@ -2975,6 +2359,7 @@ async fn process_user_anime_list_refresh_queue(
     Ok(final_status)
 }
 
+#[cfg(test)]
 fn build_user_anime_list_refresh_state(
     cache: &UserAnimeListCache,
     started_at_ms: u64,
@@ -3008,14 +2393,17 @@ fn build_user_anime_list_refresh_state(
     }
 }
 
+#[cfg(test)]
 fn user_anime_list_item_needs_detail_metadata(item: &UserAnimeListItem) -> bool {
     item.active && !item.detail_metadata_loaded && item.tags.is_empty() && item.age_rating.is_none()
 }
 
+#[cfg(test)]
 fn user_anime_list_refresh_state_has_pending(state: &UserAnimeListRefreshState) -> bool {
     state.queue.iter().any(|item| !item.done && !item.failed)
 }
 
+#[cfg(test)]
 fn user_anime_list_refresh_status_from_state(
     state: &UserAnimeListRefreshState,
     running: bool,
@@ -3049,6 +2437,7 @@ fn user_anime_list_refresh_status_from_state(
     }
 }
 
+#[cfg(test)]
 async fn refresh_new_user_anime_detail_metadata(
     api: &ShindenAPI,
     cache: &mut UserAnimeListCache,
@@ -3147,6 +2536,7 @@ fn anime_detail_age_rating(details: &AnimeDetails) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(test)]
 fn merge_user_anime_list_cache(
     cache: &mut UserAnimeListCache,
     incoming_items: Vec<WatchingListApiItem>,
@@ -3190,6 +2580,7 @@ fn merge_user_anime_list_cache(
     active_user_anime_list_items(cache)
 }
 
+#[cfg(test)]
 fn active_user_anime_list_items(cache: &UserAnimeListCache) -> Vec<UserAnimeListItem> {
     let mut items: Vec<UserAnimeListItem> = cache
         .items
@@ -3201,13 +2592,16 @@ fn active_user_anime_list_items(cache: &UserAnimeListCache) -> Vec<UserAnimeList
     items
 }
 
+#[cfg(test)]
 fn should_return_cached_user_anime_lists(cache: &UserAnimeListCache, force_refresh: bool) -> bool {
     !force_refresh && cache.items.values().any(|item| item.active)
 }
+#[cfg(test)]
 fn user_anime_list_cache_keys(cache: &UserAnimeListCache) -> HashSet<String> {
     cache.items.keys().cloned().collect()
 }
 
+#[cfg(test)]
 fn new_active_user_anime_list_cache_keys(
     cache: &UserAnimeListCache,
     existing_keys: &HashSet<String>,
@@ -3264,6 +2658,7 @@ fn release_year_from_date(value: Option<&str>) -> Option<u16> {
     value.get(0..4)?.parse::<u16>().ok()
 }
 
+#[cfg(test)]
 fn user_anime_list_cache_key(title_id: u64) -> String {
     title_id.to_string()
 }
@@ -3360,6 +2755,7 @@ fn map_discovery_anime_details(
     }
 }
 
+#[cfg(test)]
 fn has_unwatched_episodes(item: &WatchingListApiItem) -> bool {
     match item.episodes {
         Some(total) => watched_episode_count(item) < total,
@@ -3367,17 +2763,20 @@ fn has_unwatched_episodes(item: &WatchingListApiItem) -> bool {
     }
 }
 
+#[cfg(test)]
 fn watching_progress_filter_matches(
     item: &WatchingListApiItem,
     filter: &WatchingAnimeFilter,
 ) -> bool {
     !filter.only_available_unwatched() || has_unwatched_episodes(item)
 }
+#[cfg(test)]
 fn watching_filter_requires_availability_cache(filter: &WatchingAnimeFilter) -> bool {
     filter.only_available_unwatched() || filter.check_subtitle_availability_online()
 }
 
 
+#[cfg(test)]
 fn watching_cache_filter_matches(
     item: &WatchingListApiItem,
     filter: &WatchingAnimeFilter,
@@ -3415,6 +2814,7 @@ fn watching_cache_filter_matches(
         .unwrap_or(true)
 }
 
+#[cfg(test)]
 fn cache_entry_matches_item(
     entry: &WatchingAvailabilityCacheEntry,
     item: &WatchingListApiItem,
@@ -3424,6 +2824,7 @@ fn cache_entry_matches_item(
         && entry.total_episodes == item.episodes
 }
 
+#[cfg(test)]
 fn cache_entry_satisfies_refresh(
     entry: &WatchingAvailabilityCacheEntry,
     item: &WatchingListApiItem,
@@ -3450,6 +2851,7 @@ fn cache_entry_satisfies_refresh(
         .unwrap_or(true)
 }
 
+#[cfg(test)]
 fn selected_subtitle_language_key(filter: &WatchingAnimeFilter) -> Option<String> {
     if !filter.check_subtitle_availability_online() {
         return None;
@@ -3463,6 +2865,7 @@ fn selected_subtitle_language_key(filter: &WatchingAnimeFilter) -> Option<String
     }
 }
 
+#[cfg(test)]
 fn selected_subtitle_cache_key(filter: &WatchingAnimeFilter) -> Option<String> {
     selected_subtitle_language_key(filter).map(|key| {
         if filter.exclude_ai_subtitles() {
@@ -3488,6 +2891,7 @@ fn record_subtitle_language_availability(
     }
 }
 
+#[cfg(test)]
 fn watching_cache_key(title_id: u64) -> String {
     title_id.to_string()
 }
@@ -3504,7 +2908,6 @@ fn subtitle_language_matches(player_lang_subs: &str, selected_language: &str) ->
     subtitle_language_matches_with_options(player_lang_subs, selected_language, false)
 }
 
-#[cfg(test)]
 fn subtitle_language_matches_with_options(
     player_lang_subs: &str,
     selected_language: &str,
@@ -3621,10 +3024,12 @@ fn format_episode_progress(watched: Option<&str>, total: Option<u32>) -> String 
     }
 }
 
+#[cfg(test)]
 fn load_watching_availability_cache() -> WatchingAvailabilityCache {
     load_watching_availability_cache_from(&watching_availability_cache_path())
 }
 
+#[cfg(test)]
 fn load_watching_availability_cache_from(path: &Path) -> WatchingAvailabilityCache {
     fs::read_to_string(path)
         .ok()
@@ -3632,15 +3037,18 @@ fn load_watching_availability_cache_from(path: &Path) -> WatchingAvailabilityCac
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn save_watching_availability_cache(cache: &WatchingAvailabilityCache) -> Result<(), String> {
     save_watching_availability_cache_to(&watching_availability_cache_path(), cache)
         .map_err(|e| command_error("watching_cache save", e))
 }
 
+#[cfg(test)]
 fn load_user_anime_list_cache() -> UserAnimeListCache {
     load_user_anime_list_cache_from(&user_anime_list_cache_path())
 }
 
+#[cfg(test)]
 fn load_user_anime_list_cache_from(path: &Path) -> UserAnimeListCache {
     fs::read_to_string(path)
         .ok()
@@ -3648,11 +3056,13 @@ fn load_user_anime_list_cache_from(path: &Path) -> UserAnimeListCache {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn save_user_anime_list_cache(cache: &UserAnimeListCache) -> Result<(), String> {
     save_user_anime_list_cache_to(&user_anime_list_cache_path(), cache)
         .map_err(|e| command_error("user_anime_list_cache save", e))
 }
 
+#[cfg(test)]
 fn save_user_anime_list_cache_to(path: &Path, cache: &UserAnimeListCache) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -3663,14 +3073,17 @@ fn save_user_anime_list_cache_to(path: &Path, cache: &UserAnimeListCache) -> io:
     fs::write(path, contents)
 }
 
+#[cfg(test)]
 fn user_anime_list_cache_path() -> PathBuf {
     resolve_project_cache_dir().join("user-anime-lists-cache.json")
 }
 
+#[cfg(test)]
 fn load_user_anime_list_refresh_state() -> UserAnimeListRefreshState {
     load_user_anime_list_refresh_state_from(&user_anime_list_refresh_state_path())
 }
 
+#[cfg(test)]
 fn load_user_anime_list_refresh_state_from(path: &Path) -> UserAnimeListRefreshState {
     fs::read_to_string(path)
         .ok()
@@ -3678,11 +3091,13 @@ fn load_user_anime_list_refresh_state_from(path: &Path) -> UserAnimeListRefreshS
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn save_user_anime_list_refresh_state(state: &UserAnimeListRefreshState) -> Result<(), String> {
     save_user_anime_list_refresh_state_to(&user_anime_list_refresh_state_path(), state)
         .map_err(|e| command_error("user_anime_list_refresh save", e))
 }
 
+#[cfg(test)]
 fn save_user_anime_list_refresh_state_to(
     path: &Path,
     state: &UserAnimeListRefreshState,
@@ -3696,10 +3111,12 @@ fn save_user_anime_list_refresh_state_to(
     fs::write(path, contents)
 }
 
+#[cfg(test)]
 fn user_anime_list_refresh_state_path() -> PathBuf {
     resolve_project_cache_dir().join("user-anime-lists-refresh.json")
 }
 
+#[cfg(test)]
 fn save_watching_availability_cache_to(
     path: &Path,
     cache: &WatchingAvailabilityCache,
@@ -3713,10 +3130,12 @@ fn save_watching_availability_cache_to(
     fs::write(path, contents)
 }
 
+#[cfg(test)]
 fn watching_availability_cache_path() -> PathBuf {
     resolve_project_cache_dir().join("watching-anime-cache.json")
 }
 
+#[cfg(test)]
 fn begin_watching_cache_refresh(
     status: &Mutex<WatchingCacheRefreshStatus>,
 ) -> Result<Option<WatchingCacheRefreshSummary>, String> {
@@ -3759,6 +3178,7 @@ fn refresh_status_snapshot(
     Ok(lock_refresh_status(status)?.clone())
 }
 
+#[cfg(test)]
 fn update_refresh_status<F>(
     status: &Mutex<WatchingCacheRefreshStatus>,
     update: F,
@@ -3771,6 +3191,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn begin_user_anime_list_refresh(
     status: &Mutex<UserAnimeListRefreshStatus>,
     state: Option<&UserAnimeListRefreshState>,
@@ -3815,6 +3236,7 @@ fn user_anime_list_refresh_status_snapshot(
     Ok(lock_user_anime_list_refresh_status(status)?.clone())
 }
 
+#[cfg(test)]
 fn replace_user_anime_list_refresh_status(
     status: &Mutex<UserAnimeListRefreshStatus>,
     new_status: UserAnimeListRefreshStatus,
@@ -3836,6 +3258,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn fail_user_anime_list_refresh(
     status: &Mutex<UserAnimeListRefreshStatus>,
     error: &str,
@@ -3919,6 +3342,7 @@ fn resolve_project_log_dir() -> PathBuf {
         .join("logs")
 }
 
+#[cfg(test)]
 fn resolve_project_cache_dir() -> PathBuf {
     if let Ok(path) = std::env::var("SHINDEN_CLIENT_CACHE_DIR") {
         if !path.trim().is_empty() {

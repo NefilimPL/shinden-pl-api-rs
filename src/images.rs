@@ -38,6 +38,7 @@ pub(crate) fn normalize_image_url(source: &str) -> Option<Url> {
 impl ShindenAPI {
     /// Fetch images through the same cookie store and browser identity as HTML requests.
     pub async fn get_image(&self, source: &str) -> Result<ShindenImage> {
+        self.ensure_network_allowed()?;
         let url = normalize_image_url(source)
             .ok_or_else(|| anyhow::anyhow!("Unsupported Shinden image URL"))?;
         let headers = self.headers(RequestType::Frontend, url.as_str())?;
