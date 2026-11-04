@@ -105,18 +105,33 @@ pub fn parse_anime_details_html(html: &str, page_url: &str) -> AnimeDetails {
 }
 
 fn page_title(doc: &Html) -> String {
-    text_from_selector(doc, ".page-title .title")
+    text_from_selector(doc, ".page-title .title, .sh-tp-head h1")
 }
 
 fn page_media_type(doc: &Html) -> Option<String> {
-    let selector = Selector::parse(".page-title .kind").ok()?;
+    let selector = Selector::parse(".page-title .kind, .sh-tp-kind").ok()?;
     doc.select(&selector)
         .next()
-        .map(|item| clean_text(item.text()).to_ascii_lowercase())
+        .map(|item| {
+            clean_text(item.text())
+                .split('·')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+        })
         .filter(|value| !value.is_empty())
 }
 
 fn alternative_titles(doc: &Html) -> Vec<String> {
+    let modern: Vec<_> = doc
+        .select(&Selector::parse("#sh-tp-alttitles [lang]").unwrap())
+        .map(|node| clean_text(node.text()))
+        .filter(|name| !name.is_empty())
+        .collect();
+    if !modern.is_empty() {
+        return modern;
+    }
     text_from_selector(doc, ".title-other")
         .split(',')
         .map(|value| value.trim().to_string())
@@ -125,7 +140,9 @@ fn alternative_titles(doc: &Html) -> Vec<String> {
 }
 
 fn cover_image(doc: &Html) -> String {
-    let selector = Selector::parse(".title-cover img.info-aside-img").unwrap();
+    let selector =
+        Selector::parse(".title-cover img.info-aside-img, .sh-tp-cover img:not(.sh-okl-tlo)")
+            .unwrap();
     doc.select(&selector)
         .next()
         .and_then(|image| image.value().attr("src"))
@@ -138,7 +155,8 @@ fn description(doc: &Html) -> String {
 }
 
 fn information_rows(doc: &Html) -> Vec<AnimeInfoRow> {
-    let row_selector = Selector::parse(".title-small-info dl.info-aside-list").unwrap();
+    let row_selector =
+        Selector::parse(".title-small-info dl.info-aside-list, dl.sh-tp-info").unwrap();
     let term_selector = Selector::parse("dt").unwrap();
     let value_selector = Selector::parse("dd").unwrap();
     let mut rows = Vec::new();
@@ -164,6 +182,23 @@ fn information_rows(doc: &Html) -> Vec<AnimeInfoRow> {
 }
 
 fn category_groups(doc: &Html) -> Vec<AnimeCategoryGroup> {
+    let modern: Vec<_> = doc
+        .select(&Selector::parse(".sh-tp-taggroup").unwrap())
+        .map(|group| AnimeCategoryGroup {
+            label: group
+                .select(&Selector::parse("h3").unwrap())
+                .next()
+                .map(|node| clean_text(node.text()))
+                .unwrap_or_default(),
+            items: group
+                .select(&Selector::parse("ul a").unwrap())
+                .map(|node| clean_text(node.text()))
+                .collect(),
+        })
+        .collect();
+    if !modern.is_empty() {
+        return modern;
+    }
     let row_selector = Selector::parse(".info-top-table-highlight tr").unwrap();
     let cell_selector = Selector::parse("td").unwrap();
     let tag_selector = Selector::parse("ul.tags a").unwrap();
@@ -191,6 +226,39 @@ fn category_groups(doc: &Html) -> Vec<AnimeCategoryGroup> {
 }
 
 fn related_series(doc: &Html) -> Vec<RelatedSeries> {
+    let modern: Vec<_> = doc
+        .select(&Selector::parse(".sh-tp-tile").unwrap())
+        .filter_map(|item| {
+            let link = item.select(&Selector::parse("a[href]").unwrap()).next()?;
+            Some(RelatedSeries {
+                name: item
+                    .select(&Selector::parse(".sh-tp-tile__name").unwrap())
+                    .next()
+                    .map(|node| clean_text(node.text()))
+                    .unwrap_or_default(),
+                url: absolute_shinden_url(link.value().attr("href")?),
+                image_url: item
+                    .select(&Selector::parse("img").unwrap())
+                    .next()
+                    .and_then(|img| img.value().attr("src"))
+                    .map(absolute_shinden_url)
+                    .unwrap_or_default(),
+                title_type: item
+                    .select(&Selector::parse(".sh-tp-tile__kind").unwrap())
+                    .next()
+                    .map(|node| clean_text(node.text()))
+                    .unwrap_or_default(),
+                relation: item
+                    .select(&Selector::parse(".sh-tp-tile__rel").unwrap())
+                    .next()
+                    .map(|node| clean_text(node.text()))
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    if !modern.is_empty() {
+        return modern;
+    }
     let item_selector = Selector::parse("li.relation_t2t figure").unwrap();
     let caption_selector = Selector::parse("figcaption").unwrap();
     let link_selector = Selector::parse("figcaption a").unwrap();
@@ -235,7 +303,7 @@ fn related_series(doc: &Html) -> Vec<RelatedSeries> {
 
 fn community_rating(doc: &Html) -> AnimeCommunityRating {
     let mut rating = AnimeCommunityRating {
-        overall: text_from_selector(doc, ".info-aside-rating-user"),
+        overall: text_from_selector(doc, ".info-aside-rating-user, .sh-tp-score > b"),
         votes: String::new(),
         story: String::new(),
         graphics: String::new(),
@@ -243,14 +311,16 @@ fn community_rating(doc: &Html) -> AnimeCommunityRating {
         characters: String::new(),
     };
 
-    let votes_selector = Selector::parse(".info-aside-rating .h6").unwrap();
+    let votes_selector =
+        Selector::parse(".info-aside-rating .h6, .sh-tp-stats > p span:first-child").unwrap();
     rating.votes = doc
         .select(&votes_selector)
         .next()
         .map(|item| clean_text(item.text()))
         .unwrap_or_default();
 
-    let item_selector = Selector::parse(".info-aside-overall-rating li").unwrap();
+    let item_selector =
+        Selector::parse(".info-aside-overall-rating li, .sh-tp-parts span").unwrap();
     for item in doc.select(&item_selector) {
         let text = clean_text(item.text());
         let value = text
@@ -324,16 +394,19 @@ pub fn anime_rating_url(title_type: &str, title_id: u64) -> String {
 }
 
 pub fn basic_auth_token(html: &str) -> Option<String> {
-    ["_Storage.basic = \"", "_Storage.basic=\"", "_Storage.basic = '", "_Storage.basic='"]
-        .iter()
-        .find_map(|marker| {
-            let value = html
-                .split_once(marker)
-                .map(|(_, value)| value)?;
-            let quote = marker.chars().last()?;
-            let token = value.split(quote).next()?.trim();
-            (!token.is_empty()).then(|| token.to_string())
-        })
+    [
+        "_Storage.basic = \"",
+        "_Storage.basic=\"",
+        "_Storage.basic = '",
+        "_Storage.basic='",
+    ]
+    .iter()
+    .find_map(|marker| {
+        let value = html.split_once(marker).map(|(_, value)| value)?;
+        let quote = marker.chars().last()?;
+        let token = value.split(quote).next()?.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    })
 }
 
 fn text_from_selector(doc: &Html, selector: &str) -> String {
@@ -369,9 +442,10 @@ fn absolute_shinden_url(url: &str) -> String {
 }
 
 fn title_id_from_url(url: &str) -> Option<u64> {
-    let marker = "/series/";
-    let start = url.find(marker)? + marker.len();
-    let id = url[start..]
+    let path = ["/series/", "/titles/"]
+        .iter()
+        .find_map(|marker| url.split_once(marker).map(|(_, path)| path))?;
+    let id = path
         .chars()
         .take_while(|character| character.is_ascii_digit())
         .collect::<String>();
@@ -381,6 +455,43 @@ fn title_id_from_url(url: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_ids_are_kept_for_titles_routes() {
+        assert_eq!(
+            parse_anime_details_html(
+                "<html></html>",
+                "https://shinden.pl/titles/50472-devilman-crybaby"
+            )
+            .title_id,
+            Some(50472)
+        );
+    }
+
+    #[test]
+    fn parses_redesigned_title_header_cover_and_ratings() {
+        let html = r#"<div class="sh-tp-head"><span class="sh-tp-kind">Anime · TV</span><h1>Tempal: Item no Chikara</h1></div>
+          <span class="sh-tp-cover"><img src="/res/images/280x400/441887.webp"></span>
+          <div id="sh-tp-alttitles"><span lang="en">Overgeared</span></div>
+          <div id="description">Description</div>
+          <dl class="sh-tp-info"><dt>Typ</dt><dd>TV</dd></dl>
+          <div class="sh-tp-taggroup"><h3>Gatunki</h3><ul><li><a>Akcja</a></li></ul></div>
+          <section class="sh-tp-stats"><div class="sh-tp-score"><b>8,41</b> / 10</div><p><span><b>134</b> głosy</span></p><div class="sh-tp-parts"><span><b>8,47</b> Fabuła</span></div></section>"#;
+        let details = parse_anime_details_html(
+            html,
+            "https://shinden.pl/series/73355-tempal-item-no-chikara",
+        );
+        assert_eq!(details.name, "Tempal: Item no Chikara");
+        assert_eq!(
+            details.image_url,
+            "https://shinden.pl/res/images/280x400/441887.webp"
+        );
+        assert_eq!(details.alternative_titles, vec!["Overgeared"]);
+        assert_eq!(details.information[0].value, "TV");
+        assert_eq!(details.categories[0].items, vec!["Akcja"]);
+        assert_eq!(details.community_rating.overall, "8,41");
+        assert_eq!(details.community_rating.story, "8,47");
+    }
 
     #[test]
     fn parses_anime_details_from_shinden_title_html() {

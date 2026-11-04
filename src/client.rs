@@ -60,6 +60,8 @@ impl ShindenAPI {
 
         let client = Client::builder()
             .cookie_provider(jar.clone())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::default())
             .gzip(true)
             .deflate(true)
@@ -122,24 +124,64 @@ impl ShindenAPI {
     /// Import only clearance, leaving the application's login session untouched.
     /// The host application obtains this cookie from its own trusted browser window.
     pub fn import_browser_clearance(&self, user_agent: &str, cookie: &str) -> Result<()> {
+        let parsed = cookie_store::RawCookie::parse(cookie.to_owned())
+            .context("Invalid clearance cookie")?;
+        anyhow::ensure!(
+            parsed.name() == "cf_clearance" && !parsed.value().is_empty(),
+            "Missing Cloudflare clearance"
+        );
+        self.import_browser_cookies(user_agent, &[cookie.to_string()], false)
+    }
+
+    pub fn import_browser_session(&self, user_agent: &str, cookies: &[String]) -> Result<()> {
+        anyhow::ensure!(
+            cookies
+                .iter()
+                .any(|raw| cookie_store::RawCookie::parse(raw.to_owned())
+                    .ok()
+                    .is_some_and(
+                        |cookie| (matches!(cookie.name(), "sessionlogin" | "autologin")
+                            && !cookie.value().is_empty())
+                            || (cookie.name() == "sh_logged"
+                                && !matches!(cookie.value(), "" | "0" | "false"))
+                    )),
+            "Zaloguj się w oknie Shinden przed potwierdzeniem logowania."
+        );
+        self.import_browser_cookies(user_agent, cookies, true)
+    }
+
+    fn import_browser_cookies(
+        &self,
+        user_agent: &str,
+        cookies: &[String],
+        replace_session: bool,
+    ) -> Result<()> {
         anyhow::ensure!(!user_agent.trim().is_empty(), "Missing browser user agent");
         let user_agent_header =
             HeaderValue::from_str(user_agent).context("Invalid browser user agent")?;
-        let cookie = cookie_store::RawCookie::parse(cookie.to_owned())
-            .context("Invalid clearance cookie")?;
-        anyhow::ensure!(
-            cookie.name() == "cf_clearance" && !cookie.value().is_empty(),
-            "Missing Cloudflare clearance"
-        );
         let url = reqwest::Url::parse("https://shinden.pl/")?;
         let mut store = self
             .jar
             .lock()
             .map_err(|_| anyhow::anyhow!("Cookie store unavailable"))?;
-        let mut updated = store.clone();
-        updated
-            .insert_raw(&cookie, &url)
-            .map_err(|_| anyhow::anyhow!("Invalid or expired Shinden clearance cookie"))?;
+        let mut updated = if replace_session {
+            CookieStore::default()
+        } else {
+            store.clone()
+        };
+        for raw in cookies {
+            let cookie = cookie_store::RawCookie::parse(raw.to_owned())
+                .context("Invalid Shinden session cookie")?;
+            anyhow::ensure!(
+                cookie
+                    .domain()
+                    .is_none_or(|domain| domain.trim_start_matches('.') == "shinden.pl"),
+                "Unsupported Shinden session cookie domain"
+            );
+            updated
+                .insert_raw(&cookie, &url)
+                .map_err(|_| anyhow::anyhow!("Invalid or expired Shinden cookie"))?;
+        }
         let mut agent = self
             .browser_user_agent
             .write()
@@ -157,27 +199,54 @@ impl ShindenAPI {
     }
 
     pub async fn get_html(&self, url: &str) -> Result<String> {
+        let response = self.frontend_response(url).await?;
+        let body = response.text().await?;
+        save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
+        Ok(body)
+    }
+
+    async fn frontend_response(&self, url: &str) -> Result<Response> {
         let headers = self.headers(RequestType::Frontend, url)?;
         let response = self
             .request(Method::GET, url)
             .headers(headers)
             .send()
             .await?;
-        let response = check_response(response)?;
+        match check_response(response) {
+            Err(error)
+                if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                    error.status() == Some(reqwest::StatusCode::NOT_FOUND)
+                }) =>
+            {
+                let Some(alternate) = alternate_title_url(url) else {
+                    return Err(error);
+                };
+                let headers = self.headers(RequestType::Frontend, &alternate)?;
+                check_response(
+                    self.request(Method::GET, &alternate)
+                        .headers(headers)
+                        .send()
+                        .await?,
+                )
+            }
+            result => result,
+        }
+    }
 
-        let body = response.text().await?;
-
+    pub(crate) async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
+        let headers = self.headers(RequestType::Api, url)?;
+        let response = self
+            .request(Method::GET, url)
+            .headers(headers)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .send()
+            .await?;
+        let body = check_response(response)?.json().await?;
         save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
         Ok(body)
     }
     pub async fn resolve_final_url(&self, url: &str) -> Result<String> {
-        let headers = self.headers(RequestType::Frontend, url)?;
-        let response = self
-            .request(Method::GET, url)
-            .headers(headers)
-            .send()
-            .await?;
-        let response = check_response(response)?;
+        let response = self.frontend_response(url).await?;
 
         let resolved_url = response.url().to_string();
         save_cookies(&self.jar.lock().unwrap(), &self.cookie_path)?;
@@ -210,6 +279,32 @@ impl ShindenAPI {
     }
 }
 
+fn alternate_title_url(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value).ok()?;
+    let (prefix, suffix) = url
+        .path()
+        .strip_prefix("/series/")
+        .map(|path| ("/titles/", path))
+        .or_else(|| {
+            url.path()
+                .strip_prefix("/titles/")
+                .map(|path| ("/series/", path))
+        })?;
+    let id = suffix
+        .split('/')
+        .next()?
+        .split('-')
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    if id == 0 {
+        return None;
+    }
+    let path = format!("{prefix}{suffix}");
+    url.set_path(&path);
+    Some(url.to_string())
+}
+
 fn load_cookies(path: &std::path::Path) -> Result<CookieStore> {
     if path.exists() {
         let file = File::open(path)?;
@@ -232,6 +327,258 @@ fn save_cookies(store: &CookieStore, path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_series_route_resolves_to_titles_before_loading_episodes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/series/50472", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (path, status, body) in [
+                ("/series/50472", "404 Not Found", "Missing"),
+                ("/titles/50472", "200 OK", "Title page"),
+                (
+                    "/titles/50472/episodes",
+                    "200 OK",
+                    r#"<section id="odcinki"><ol class="ep-rows"><li class="ep-row"><a class="ep-row__link" href="/epek/50472-devilman-crybaby/view/160715"><span class="ep-row__no">1</span></a></li></ol></section>"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 8192];
+                let size = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..size]).starts_with(&format!("GET {path} "))
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let storage = TestStorage::new();
+        let api = storage.api();
+        let episodes = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(api.get_episodes(&url))
+            .unwrap();
+        assert_eq!(
+            episodes[0].link,
+            "https://shinden.pl/epek/50472-devilman-crybaby/view/160715"
+        );
+    }
+
+    #[test]
+    fn browser_login_imports_first_party_session_and_rejects_other_domains_atomically() {
+        let storage = TestStorage::new();
+        let api = storage.api();
+        assert!(
+            api.import_browser_session(
+                "Browser/123",
+                &[
+                    "sessionlogin=active; Path=/; Secure; Max-Age=3600".into(),
+                    "other=bad; Domain=example.com".into()
+                ]
+            )
+            .is_err()
+        );
+        assert!(!storage.0.join("cookies.json").exists());
+        assert!(
+            api.import_browser_session(
+                "Browser/123",
+                &["cf_clearance=clear; Path=/; Secure; Max-Age=3600".into()]
+            )
+            .is_err()
+        );
+        api.import_browser_session(
+            "Browser/123",
+            &[
+                "sessionlogin=active; Path=/; Secure; HttpOnly; Max-Age=3600".into(),
+                "sh_logged=1; Path=/; Secure; Max-Age=3600".into(),
+            ],
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("https://shinden.pl/").unwrap();
+        assert!(
+            api.jar
+                .lock()
+                .unwrap()
+                .get_request_values(&url)
+                .any(|(name, value)| name == "sessionlogin" && value == "active")
+        );
+    }
+
+    #[test]
+    fn browser_login_cannot_reuse_a_previous_accounts_absent_cookies() {
+        let storage = TestStorage::new();
+        let api = storage.api();
+        api.import_browser_session(
+            "Browser/123",
+            &["sessionlogin=previous; Path=/; Secure; Max-Age=3600".into()],
+        )
+        .unwrap();
+        assert!(
+            api.import_browser_session(
+                "Browser/123",
+                &["sh_logged=0; Path=/; Secure; Max-Age=3600".into()]
+            )
+            .is_err()
+        );
+        api.import_browser_session(
+            "Browser/123",
+            &["sh_logged=1; Path=/; Secure; Max-Age=3600".into()],
+        )
+        .unwrap();
+        let url = reqwest::Url::parse("https://shinden.pl/").unwrap();
+        assert!(
+            !api.jar
+                .lock()
+                .unwrap()
+                .get_request_values(&url)
+                .any(|(name, _)| name == "sessionlogin")
+        );
+    }
+
+    fn episode_server(first_status: &str, first_body: &str, episode_body: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/series/71632-kokoore",
+            listener.local_addr().unwrap()
+        );
+        let mut responses = vec![
+            (
+                "/series/71632-kokoore/episodes",
+                first_status.to_string(),
+                first_body.to_string(),
+            ),
+            (
+                "/series/71632-kokoore/all-episodes",
+                "200 OK".to_string(),
+                episode_body.to_string(),
+            ),
+        ];
+        if first_status == "404 Not Found" {
+            responses.insert(
+                1,
+                (
+                    "/titles/71632-kokoore/episodes",
+                    "404 Not Found".to_string(),
+                    "Missing".to_string(),
+                ),
+            );
+        }
+        std::thread::spawn(move || {
+            for (path, status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 8192];
+                let size = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..size]).starts_with(&format!("GET {path} "))
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        url
+    }
+
+    fn load_test_episodes(
+        first_status: &str,
+        first_body: &str,
+        body: &str,
+    ) -> Result<Vec<crate::models::Episode>> {
+        let storage = TestStorage::new();
+        let api = storage.api();
+        let url = episode_server(first_status, first_body, body);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(api.get_episodes(&url))
+    }
+
+    #[test]
+    fn episodes_recover_using_all_episodes_when_current_route_has_no_table() {
+        let body = r#"<table><tbody class="list-episode-checkboxes">
+            <tr><td class="ep-title">Odcinek 1</td><td><a class="button active" href="/episode/1">Play</a></td></tr>
+        </tbody></table>"#;
+        for status in ["200 OK", "404 Not Found"] {
+            let episodes =
+                load_test_episodes(status, "<html>Missing episode page</html>", body).unwrap();
+            assert_eq!(episodes.len(), 1);
+            assert_eq!(episodes[0].link, "https://shinden.pl/episode/1");
+        }
+    }
+
+    #[test]
+    fn unavailable_episode_rows_keep_their_positions_and_playback_links() {
+        let episodes = load_test_episodes(
+            "200 OK",
+            r#"<table><tbody class="list-episode-checkboxes">
+            <tr><td class="ep-title">Third title</td><td><a class="button active" href="https://shinden.pl/episode/3">Play</a></td></tr>
+            <tr><td class="ep-title">Second title</td><td><a class="button disabled">Play</a></td></tr>
+            <tr><td class="ep-title">First title</td><td><a class="button active" href="/episode/1">Play</a></td></tr>
+        </tbody></table>"#,
+            "",
+        ).unwrap();
+        assert_eq!(episodes.len(), 3);
+        assert_eq!(episodes[0].title, "First title");
+        assert_eq!(episodes[0].link, "https://shinden.pl/episode/1");
+        assert_eq!(episodes[1].title, "Second title");
+        assert_eq!(episodes[1].link, "");
+        assert_eq!(episodes[2].title, "Third title");
+        assert_eq!(episodes[2].link, "https://shinden.pl/episode/3");
+    }
+
+    #[test]
+    fn an_empty_episode_table_is_a_successful_pre_premiere_snapshot() {
+        let episodes = load_test_episodes(
+            "200 OK",
+            r#"<table><tbody class="list-episode-checkboxes"></tbody></table>"#,
+            "",
+        )
+        .unwrap();
+        assert!(episodes.is_empty());
+    }
+
+    #[test]
+    fn episode_fallback_preserves_access_denials_and_browser_verification() {
+        let body = r#"<table><tbody class="list-episode-checkboxes"></tbody></table>"#;
+        let error = load_test_episodes("403 Forbidden", "Forbidden", body)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("403"), "{error}");
+        let error = load_test_episodes("200 OK\r\ncf-mitigated: challenge", "Challenge", body)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(BROWSER_VERIFICATION_REQUIRED), "{error}");
+    }
+
+    #[test]
+    fn missing_episode_tables_are_errors_instead_of_empty_premiere_snapshots() {
+        let error = load_test_episodes(
+            "200 OK",
+            "<html>Not episodes</html>",
+            "<html>Not episodes either</html>",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Could not find episode table"), "{error}");
+    }
 
     struct TestStorage(PathBuf);
 
